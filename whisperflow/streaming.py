@@ -32,23 +32,46 @@ async def transcribe(
         if not window:
             continue
 
-        result = {
-            "is_partial": True,
-            "data": await transcriber(window),
-            "time": (time.time() - start) * 1000,
-        }
+        try:
+            result = {
+                "is_partial": True,
+                "data": await transcriber(window),
+                "time": (time.time() - start) * 1000,
+            }
 
-        if should_close_segment(result, prev_result, cycles):
+            if should_close_segment(result, prev_result, cycles):
+                window, prev_result, cycles = [], {}, 0
+                result["is_partial"] = False
+            elif result["data"]["text"] == prev_result.get("data", {}).get("text", ""):
+                cycles += 1
+            else:
+                cycles = 0
+                prev_result = result
+
+            if result["data"]["text"]:
+                await segment_closed(result)
+
+        except Exception as e:
+            # Manejar errores de transcripción (ej: audio demasiado corto)
+            error_msg = str(e)
+            if "audio_too_short" in error_msg or "too short" in error_msg.lower():
+                error_result = {
+                    "is_partial": False,
+                    "data": {"text": "⚠️ Audio muy corto - Habla por al menos 1 segundo"},
+                    "error": "audio_too_short",
+                    "time": (time.time() - start) * 1000,
+                }
+            else:
+                error_result = {
+                    "is_partial": False,
+                    "data": {"text": f"❌ Error de transcripción: {error_msg[:100]}"},
+                    "error": "transcription_error",
+                    "time": (time.time() - start) * 1000,
+                }
+            # Enviar error al cliente
+            await segment_closed(error_result)
+            # Limpiar ventana y continuar
             window, prev_result, cycles = [], {}, 0
-            result["is_partial"] = False
-        elif result["data"]["text"] == prev_result.get("data", {}).get("text", ""):
-            cycles += 1
-        else:
-            cycles = 0
-            prev_result = result
-
-        if result["data"]["text"]:
-            await segment_closed(result)
 
 
 def should_close_segment(result: dict, prev_result: dict, cycles, max_cycles=1):

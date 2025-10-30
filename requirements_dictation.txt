@@ -1,0 +1,15 @@
+# Dependencias adicionales para el Cliente de Dictado Universal
+# Instalar con: pip install -r requirements_dictation.txt
+
+# Dependencias del proyecto base
+-r requirements.txt
+
+# Dependencias adicionales para dictado universal
+pynput==1.7.6          # Captura de hotkeys y simulación de teclado
+pyperclip==1.8.2       # Gestión del clipboard del sistema
+websockets==12.0       # Cliente WebSocket (puede ser diferente versión del servidor)
+
+# Dependencias del sistema (instalar manualmente si es necesario):
+# Ubuntu/Debian: sudo apt-get install python3-tk python3-dev
+# macOS: brew install python-tk
+# Windows: incluido con Python 

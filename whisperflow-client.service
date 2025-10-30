@@ -1,0 +1,21 @@
+[Unit]
+Description=WhisperFlow Universal Dictation Client
+After=network.target docker.service
+Wants=docker.service
+Requires=network.target
+
+[Service]
+Type=simple
+User=aseis
+WorkingDirectory=/mnt/d/Dev/whisperflow-cloud
+Environment="DISPLAY=:0"
+Environment="PULSE_SERVER=unix:/mnt/wslg/PulseServer"
+ExecStartPre=/bin/sleep 10
+ExecStart=/mnt/d/Dev/whisperflow-cloud/.venv/bin/python /mnt/d/Dev/whisperflow-cloud/universal_dictation_client.py
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  whisperflow-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whisperflow-server
+    ports:
+      - "8181:8181"
+    volumes:
+      - ./whisperflow/models:/app/whisperflow/models:ro
+    environment:
+      - PORT=8181
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - TRANSCRIPTION_MODE=${TRANSCRIPTION_MODE:-openai}
+      - LOCAL_MODEL=${LOCAL_MODEL:-small}
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8181/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

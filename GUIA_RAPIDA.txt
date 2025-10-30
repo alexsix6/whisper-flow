@@ -1,0 +1,92 @@
+═══════════════════════════════════════════════════════════════
+  WHISPERFLOW - GUÍA RÁPIDA DE INICIO
+═══════════════════════════════════════════════════════════════
+
+📌 OPCIÓN 1 - LA MÁS SIMPLE (RECOMENDADA)
+───────────────────────────────────────────────────────────────
+
+1. Abre "Ubuntu" desde el menú inicio de Windows
+
+2. Ejecuta estos 2 comandos:
+
+   cd /mnt/d/Dev/whisperflow-cloud
+   ./whisperflow_simple.sh start
+
+3. Espera 10 segundos, luego ejecuta:
+
+   ./start_gui.sh
+
+4. ¡LISTO! La ventana debe aparecer visible ✅
+
+
+📌 OPCIÓN 2 - CON ARCHIVO .BAT (SI PREFIERES DOBLE CLICK)
+───────────────────────────────────────────────────────────────
+
+1. Doble click en: INICIAR_WHISPERFLOW.bat
+
+2. Espera que termine (dice "Servidor LISTO")
+
+3. Abre "Ubuntu" desde menú inicio
+
+4. Ejecuta:
+
+   cd /mnt/d/Dev/whisperflow-cloud
+   ./start_gui.sh
+
+5. ¡LISTO! La ventana debe aparecer visible ✅
+
+
+📌 PARA DETENER TODO
+───────────────────────────────────────────────────────────────
+
+Opción A - Desde la ventana GUI:
+  - Ctrl+C en la terminal donde está corriendo
+
+Opción B - Desde WSL:
+  cd /mnt/d/Dev/whisperflow-cloud
+  ./whisperflow_simple.sh stop
+
+
+📌 SOLUCIÓN AL PROBLEMA UTF-8 (CARACTERES ESPECIALES)
+───────────────────────────────────────────────────────────────
+
+✅ YA EJECUTASTE: Los comandos PowerShell para UTF-8 permanente
+
+🔄 AHORA NECESITAS: Reiniciar Windows
+
+Después del reinicio, todos los caracteres españoles (tildes, Ñ)
+funcionarán automáticamente en cualquier terminal.
+
+
+═══════════════════════════════════════════════════════════════
+  ¿POR QUÉ ESTA MANERA ES MEJOR?
+═══════════════════════════════════════════════════════════════
+
+✅ La GUI corre directamente en WSL (su entorno nativo)
+✅ La ventana aparece visible SIEMPRE
+✅ Puedes ver todos los logs y mensajes
+✅ Ctrl+C funciona correctamente para cerrar
+✅ No hay problemas de ventanas escondidas
+
+
+═══════════════════════════════════════════════════════════════
+  TROUBLESHOOTING
+═══════════════════════════════════════════════════════════════
+
+❌ "Docker no está corriendo"
+→ Abre Docker Desktop manualmente
+
+❌ "Servidor no responde"
+→ ./whisperflow_simple.sh status
+→ docker logs whisperflow-server
+
+❌ "GUI no aparece"
+→ Verifica que ejecutaste en terminal WSL (Ubuntu), NO PowerShell
+
+❌ "Caracteres raros (Ã±, Ã³)"
+→ Reinicia Windows (ya configuraste UTF-8)
+
+
+═══════════════════════════════════════════════════════════════
+Última actualización: 2025-10-19 23:45
+═══════════════════════════════════════════════════════════════
