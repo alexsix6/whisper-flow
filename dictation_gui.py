@@ -298,12 +298,18 @@ class DictationGUI:
             print(f"✅ Captura completa: {chunks_sent} chunks ({bytes_sent / 1024:.1f} KB) en {elapsed:.1f}s")
 
         except Exception as e:
-            print(f"❌ Error capturando audio: {e}")
-            self.is_recording = False
-            error_msg = str(e)[:50]
-            self.root.after(0, lambda msg=error_msg: self.transcription_label.config(
-                text=f"❌ Error: {msg}"
-            ))
+            # Error -9999 es normal en WSL2 cuando el stream se cierra durante read()
+            # Chequear por mensaje, NO por tipo de excepción
+            if "-9999" in str(e) or "Unanticipated host error" in str(e):
+                elapsed = time.time() - start_time
+                print(f"✅ Captura finalizada: {chunks_sent} chunks ({bytes_sent / 1024:.1f} KB) en {elapsed:.1f}s (stream cerrado)")
+            else:
+                print(f"❌ Error capturando audio: {e}")
+                self.is_recording = False
+                error_msg = str(e)[:50]
+                self.root.after(0, lambda msg=error_msg: self.transcription_label.config(
+                    text=f"❌ Error: {msg}"
+                ))
 
     def insert_text(self, text: str):
         """Inserta texto en la aplicación activa"""
