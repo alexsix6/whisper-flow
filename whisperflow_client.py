@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
 """
-WhisperFlow Cloud Client — Windows Native
-Dual mode: Microphone + System Audio (WASAPI Loopback)
-Connects via WSS to Cloud Run server.
+WhisperFlow Cloud Client v2.0 — Enterprise-Grade Windows Native
+Dual mode: Microphone + System Audio (Stereo Mix / WASAPI Loopback)
+Audio engine: sounddevice (PortAudio CFFI) with fallback chain
+Connects via WSS to Cloud Run server with token auth.
 """
 
 import asyncio
 import json
+import logging
 import os
 import threading
 import time
 import tkinter as tk
 from tkinter import ttk
-from typing import Optional
 
+import numpy as np
 import pyperclip
+import sounddevice as sd
 import websockets
 
-# Try PyAudioWPatch first (WASAPI loopback support), fall back to PyAudio
-try:
-    import pyaudiowpatch as pyaudio
-    HAS_WASAPI_LOOPBACK = True
-except ImportError:
-    import pyaudio
-    HAS_WASAPI_LOOPBACK = False
+# --- Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("whisperflow")
 
 # --- Configuration ---
 DEFAULT_SERVER = os.getenv(
@@ -31,137 +34,193 @@ DEFAULT_SERVER = os.getenv(
     "wss://whisperflow-server-518312107738.us-central1.run.app/ws",
 )
 AUTH_TOKEN = os.getenv("WHISPERFLOW_AUTH_TOKEN", "")
-TARGET_SAMPLE_RATE = 16000  # OpenAI expects 16kHz mono PCM16
+TARGET_SAMPLE_RATE = 16000  # OpenAI Whisper expects 16kHz mono PCM16
+BLOCK_SIZE = 4096  # Samples per read block
 
+
+# =============================================================================
+# WebSocket helpers (compatible with websockets v13–v15+)
+# =============================================================================
 
 def _ws_is_open(ws) -> bool:
-    """Check if websocket is open (compatible with websockets v13-v15+)."""
     if ws is None:
         return False
-    # v15+: ClientConnection has no .closed, use .state
     try:
         return ws.state.name == "OPEN"
     except AttributeError:
         pass
-    # v13 and below: .closed is a bool (True = closed)
     try:
         return not ws.closed
     except AttributeError:
         return False
 
 
-def _stereo_to_mono(data: bytes) -> bytes:
-    """Convert stereo PCM16 to mono by averaging channels (no audioop)."""
-    samples = len(data) // 4  # 2 bytes per sample, 2 channels
-    mono = bytearray(samples * 2)
-    for i in range(samples):
-        left = int.from_bytes(data[i * 4 : i * 4 + 2], "little", signed=True)
-        right = int.from_bytes(data[i * 4 + 2 : i * 4 + 4], "little", signed=True)
-        avg = (left + right) // 2
-        mono[i * 2 : i * 2 + 2] = avg.to_bytes(2, "little", signed=True)
-    return bytes(mono)
+# =============================================================================
+# Audio Device Discovery
+# =============================================================================
 
+class AudioDeviceManager:
+    """Discovers and categorises available audio devices."""
 
-def _resample_linear(data: bytes, src_rate: int, dst_rate: int) -> bytes:
-    """Simple linear interpolation resampling for PCM16 mono (no audioop)."""
-    if src_rate == dst_rate:
-        return data
-    src_samples = len(data) // 2
-    ratio = dst_rate / src_rate
-    dst_samples = int(src_samples * ratio)
-    result = bytearray(dst_samples * 2)
-    for i in range(dst_samples):
-        src_pos = i / ratio
-        idx = int(src_pos)
-        frac = src_pos - idx
-        s0 = int.from_bytes(data[idx * 2 : idx * 2 + 2], "little", signed=True)
-        if idx + 1 < src_samples:
-            s1 = int.from_bytes(data[(idx + 1) * 2 : (idx + 1) * 2 + 2], "little", signed=True)
-        else:
-            s1 = s0
-        val = int(s0 + frac * (s1 - s0))
-        val = max(-32768, min(32767, val))
-        result[i * 2 : i * 2 + 2] = val.to_bytes(2, "little", signed=True)
-    return bytes(result)
+    SYSTEM_AUDIO_KEYWORDS = ["stereo mix", "mezcla estéreo", "loopback", "what u hear"]
+    MIC_EXCLUDE_KEYWORDS = ["loopback", "mezcla", "stereo mix", "cable", "virtual"]
 
+    def __init__(self):
+        self.devices = sd.query_devices()
+        self._log_devices()
 
-class AudioSource:
-    """Manages audio capture from microphone or system audio."""
+    def _log_devices(self):
+        log.info("--- Audio Devices ---")
+        for i, d in enumerate(self.devices):
+            if d["max_input_channels"] > 0:
+                api = sd.query_hostapis(d["hostapi"])["name"]
+                log.info(
+                    f"  [{i}] {d['name']} ({api}) "
+                    f"ch={d['max_input_channels']} rate={int(d['default_samplerate'])}"
+                )
+        log.info("--- End Devices ---")
 
-    def __init__(self, pa: pyaudio.PyAudio, mode: str = "mic"):
-        self.pa = pa
-        self.mode = mode  # "mic" or "system"
-        self.stream = None
-        self.device_info = None
-        self.source_rate = TARGET_SAMPLE_RATE
-        self.channels = 1
+    def find_microphone(self) -> dict:
+        """Find the best microphone: prefer WASAPI, fallback to default."""
+        # Strategy 1: WASAPI mic (lowest latency, best quality)
+        wasapi_mics = self._find_by_api("WASAPI", is_loopback=False)
+        if wasapi_mics:
+            chosen = wasapi_mics[0]
+            log.info(f"Mic selected (WASAPI): [{chosen['index']}] {chosen['name']}")
+            return chosen
 
-    def open(self):
-        if self.mode == "system":
-            return self._open_system()
-        return self._open_mic()
+        # Strategy 2: System default input
+        default_idx = sd.default.device[0]
+        if default_idx is not None and default_idx >= 0:
+            info = self.devices[default_idx]
+            log.info(f"Mic selected (default): [{default_idx}] {info['name']}")
+            return {**info, "index": default_idx}
 
-    def _open_mic(self):
-        """Open default microphone at 16kHz mono."""
-        self.source_rate = TARGET_SAMPLE_RATE
-        self.channels = 1
-        self.stream = self.pa.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=TARGET_SAMPLE_RATE,
-            input=True,
-            frames_per_buffer=4096,
+        raise RuntimeError("No microphone found on this system")
+
+    def find_system_audio(self) -> dict:
+        """Find the best system audio capture device."""
+        # Strategy 1: WASAPI Loopback (captures from active output)
+        loopbacks = self._find_by_api("WASAPI", is_loopback=True)
+        if loopbacks:
+            chosen = loopbacks[0]
+            log.info(f"System audio selected (Loopback): [{chosen['index']}] {chosen['name']}")
+            return chosen
+
+        # Strategy 2: Stereo Mix / Mezcla estéreo (any API)
+        for i, d in enumerate(self.devices):
+            name_lower = d["name"].lower()
+            if d["max_input_channels"] > 0 and any(
+                kw in name_lower for kw in self.SYSTEM_AUDIO_KEYWORDS
+            ):
+                log.info(f"System audio selected (Stereo Mix): [{i}] {d['name']}")
+                return {**d, "index": i}
+
+        raise RuntimeError(
+            "No system audio device found. Enable 'Stereo Mix' in Windows Sound settings "
+            "or connect an audio output device."
         )
-        return True
 
-    def _open_system(self):
-        """Open WASAPI loopback (system audio) via PyAudioWPatch."""
-        if not HAS_WASAPI_LOOPBACK:
-            raise RuntimeError(
-                "PyAudioWPatch not installed. Run: pip install PyAudioWPatch"
+    def _find_by_api(self, api_name: str, is_loopback: bool) -> list:
+        """Find input devices filtered by host API and loopback status."""
+        results = []
+        for i, d in enumerate(self.devices):
+            if d["max_input_channels"] <= 0:
+                continue
+            api = sd.query_hostapis(d["hostapi"])["name"]
+            if api_name not in api:
+                continue
+
+            name_lower = d["name"].lower()
+            has_loopback_keyword = any(
+                kw in name_lower for kw in self.SYSTEM_AUDIO_KEYWORDS
             )
 
-        self.device_info = self.pa.get_default_wasapi_loopback()
-        self.source_rate = int(self.device_info["defaultSampleRate"])
-        self.channels = self.device_info["maxInputChannels"]
+            if is_loopback and has_loopback_keyword:
+                results.append({**d, "index": i})
+            elif not is_loopback and not has_loopback_keyword:
+                # Exclude virtual/cable devices for mic
+                if not any(kw in name_lower for kw in self.MIC_EXCLUDE_KEYWORDS):
+                    results.append({**d, "index": i})
 
-        self.stream = self.pa.open(
-            format=pyaudio.paInt16,
-            channels=self.channels,
-            rate=self.source_rate,
-            input=True,
-            input_device_index=self.device_info["index"],
-            frames_per_buffer=4096,
+        return results
+
+
+# =============================================================================
+# Audio Capture Engine (sounddevice-based)
+# =============================================================================
+
+class AudioSource:
+    """Enterprise-grade audio capture with resampling pipeline."""
+
+    def __init__(self, device_info: dict):
+        self.device_index = device_info["index"]
+        self.device_name = device_info["name"]
+        self.source_rate = int(device_info["default_samplerate"])
+        self.channels = int(device_info["max_input_channels"])
+        self.stream = None
+
+    def open(self):
+        log.info(
+            f"Opening: [{self.device_index}] {self.device_name} "
+            f"@ {self.source_rate}Hz ch={self.channels}"
         )
-        return True
+        self.stream = sd.InputStream(
+            samplerate=self.source_rate,
+            channels=self.channels,
+            dtype="int16",
+            device=self.device_index,
+            blocksize=BLOCK_SIZE,
+        )
+        self.stream.start()
+        log.info("Audio stream opened OK")
 
     def read_chunk(self) -> bytes:
-        """Read a chunk and return 16kHz mono PCM16 bytes."""
-        raw = self.stream.read(4096, exception_on_overflow=False)
+        """Read audio chunk → mono 16kHz PCM16 bytes (OpenAI-ready)."""
+        data, overflowed = self.stream.read(BLOCK_SIZE)
+        if overflowed:
+            log.debug("Audio buffer overflow (non-critical)")
 
-        # Convert stereo to mono if needed
+        # data shape: (BLOCK_SIZE, channels) as int16 numpy array
+        audio = data.astype(np.float32)
+
+        # Stereo → mono: average channels
         if self.channels > 1:
-            raw = _stereo_to_mono(raw)
+            audio = audio.mean(axis=1)
+        else:
+            audio = audio.flatten()
 
-        # Resample if source rate differs from 16kHz
+        # Resample if needed (e.g. 44100/48000 → 16000)
         if self.source_rate != TARGET_SAMPLE_RATE:
-            raw = _resample_linear(raw, self.source_rate, TARGET_SAMPLE_RATE)
+            ratio = TARGET_SAMPLE_RATE / self.source_rate
+            new_length = int(len(audio) * ratio)
+            indices = np.arange(new_length) / ratio
+            idx_floor = np.clip(indices.astype(int), 0, len(audio) - 1)
+            idx_ceil = np.clip(idx_floor + 1, 0, len(audio) - 1)
+            frac = indices - idx_floor
+            audio = audio[idx_floor] * (1 - frac) + audio[idx_ceil] * frac
 
-        return raw
+        # Float32 → PCM16 bytes
+        pcm16 = np.clip(audio, -32768, 32767).astype(np.int16)
+        return pcm16.tobytes()
 
     def close(self):
         if self.stream:
             try:
-                if self.stream.is_active():
-                    self.stream.stop_stream()
+                self.stream.stop()
                 self.stream.close()
             except Exception:
                 pass
             self.stream = None
+            log.info("Audio stream closed")
 
+
+# =============================================================================
+# WhisperFlow Cloud Client GUI
+# =============================================================================
 
 class WhisperFlowClient:
-    """GUI client for WhisperFlow Cloud with dual audio mode."""
+    """Enterprise-grade GUI client for WhisperFlow Cloud."""
 
     def __init__(self):
         self.server_url = DEFAULT_SERVER
@@ -172,18 +231,24 @@ class WhisperFlowClient:
         self.is_recording = False
         self.is_connected = False
         self.websocket = None
-        self.audio_mode = "mic"  # "mic" or "system"
-
-        self.pa = pyaudio.PyAudio()
-        self.audio_source: Optional[AudioSource] = None
+        self.audio_source = None
         self.loop = None
+
+        # Discover audio devices at startup
+        self.device_mgr = AudioDeviceManager()
+        self.has_system_audio = False
+        try:
+            self.device_mgr.find_system_audio()
+            self.has_system_audio = True
+        except RuntimeError:
+            log.warning("System audio capture not available")
 
         self._build_gui()
 
     def _build_gui(self):
         self.root = tk.Tk()
         self.root.title("WhisperFlow Cloud")
-        self.root.geometry("420x380")
+        self.root.geometry("440x400")
         self.root.resizable(False, False)
 
         style = ttk.Style()
@@ -192,11 +257,11 @@ class WhisperFlowClient:
         main = ttk.Frame(self.root, padding="20")
         main.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(main, text="WhisperFlow Cloud", font=("Arial", 16, "bold")).pack(
-            pady=(0, 10)
-        )
+        ttk.Label(
+            main, text="WhisperFlow Cloud", font=("Arial", 16, "bold")
+        ).pack(pady=(0, 10))
 
-        # Audio mode selector
+        # Audio source selector
         mode_frame = ttk.LabelFrame(main, text="Audio Source", padding="10")
         mode_frame.pack(fill=tk.X, pady=(0, 10))
 
@@ -205,18 +270,15 @@ class WhisperFlowClient:
             mode_frame, text="Microphone", variable=self.mode_var, value="mic"
         ).pack(side=tk.LEFT, padx=10)
 
-        system_label = "System Audio (WASAPI)" if HAS_WASAPI_LOOPBACK else "System Audio (not available)"
-        system_rb = ttk.Radiobutton(
-            mode_frame,
-            text=system_label,
-            variable=self.mode_var,
-            value="system",
+        sys_label = "System Audio" if self.has_system_audio else "System Audio (N/A)"
+        sys_rb = ttk.Radiobutton(
+            mode_frame, text=sys_label, variable=self.mode_var, value="system"
         )
-        system_rb.pack(side=tk.LEFT, padx=10)
-        if not HAS_WASAPI_LOOPBACK:
-            system_rb.configure(state=tk.DISABLED)
+        sys_rb.pack(side=tk.LEFT, padx=10)
+        if not self.has_system_audio:
+            sys_rb.configure(state=tk.DISABLED)
 
-        # Status
+        # Connection status
         self.status_label = ttk.Label(main, text="Connecting...", font=("Arial", 10))
         self.status_label.pack(pady=5)
 
@@ -242,22 +304,21 @@ class WhisperFlowClient:
         )
         self.rec_label.pack(pady=5)
 
-        # Transcription
+        # Transcription display
         self.text_label = ttk.Label(
-            main, text="", font=("Arial", 9), foreground="#555", wraplength=380
+            main, text="", font=("Arial", 9), foreground="#555", wraplength=400
         )
         self.text_label.pack(pady=5)
 
         # Server info
         host = self.server_url.split("//")[1].split("/")[0] if "//" in self.server_url else "local"
         ttk.Label(
-            main,
-            text=f"Server: {host}",
-            font=("Arial", 8),
-            foreground="#999",
+            main, text=f"Server: {host}", font=("Arial", 8), foreground="#999"
         ).pack(side=tk.BOTTOM, pady=5)
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # --- Recording Controls ---
 
     def _toggle_recording(self):
         if self.is_recording:
@@ -266,7 +327,6 @@ class WhisperFlowClient:
             self._start_recording()
 
     def _start_recording(self):
-        # Reconnect if needed
         if not _ws_is_open(self.websocket):
             self.text_label.config(text="Reconnecting...")
             self.record_btn.config(state=tk.DISABLED)
@@ -274,20 +334,26 @@ class WhisperFlowClient:
             self.root.after(1500, self._start_recording)
             return
 
-        self.audio_mode = self.mode_var.get()
-        self.audio_source = AudioSource(self.pa, self.audio_mode)
-
+        mode = self.mode_var.get()
         try:
+            if mode == "system":
+                device_info = self.device_mgr.find_system_audio()
+            else:
+                device_info = self.device_mgr.find_microphone()
+
+            self.audio_source = AudioSource(device_info)
             self.audio_source.open()
         except Exception as e:
+            log.error(f"Failed to open audio: {e}")
             self.text_label.config(text=f"Audio error: {str(e)[:80]}")
             return
 
         self.is_recording = True
         self.record_btn.config(text="STOP", bg="#27ae60", activebackground="#229954")
-        src = "System Audio" if self.audio_mode == "system" else "Microphone"
+        src = "System Audio" if mode == "system" else "Microphone"
         self.rec_label.config(text=f"RECORDING ({src})...")
-        self.text_label.config(text="Speak now..." if self.audio_mode == "mic" else "Play audio...")
+        prompt = "Play audio..." if mode == "system" else "Speak now..."
+        self.text_label.config(text=prompt)
 
         threading.Thread(target=self._capture_loop, daemon=True).start()
 
@@ -304,7 +370,7 @@ class WhisperFlowClient:
         self.text_label.config(text="Waiting for transcription...")
 
     def _capture_loop(self):
-        """Capture audio and send to server."""
+        """Continuous audio capture → WebSocket send loop."""
         chunks_sent = 0
         bytes_sent = 0
         t0 = time.time()
@@ -320,29 +386,34 @@ class WhisperFlowClient:
                         self.websocket.send(chunk), self.loop
                     )
                 else:
+                    log.warning("WebSocket closed during capture")
                     break
 
                 if chunks_sent % 20 == 0:
                     elapsed = time.time() - t0
-                    print(
-                        f"Audio: {chunks_sent} chunks ({bytes_sent / 1024:.0f} KB) in {elapsed:.1f}s"
+                    log.info(
+                        f"Streaming: {chunks_sent} chunks "
+                        f"({bytes_sent / 1024:.0f} KB) in {elapsed:.1f}s"
                     )
 
+        except sd.PortAudioError as e:
+            log.warning(f"Audio stream ended: {e}")
         except Exception as e:
-            err = str(e)
-            if "-9999" in err or "Unanticipated host error" in err:
-                pass  # Normal on stream close (WSL2/Windows)
-            else:
-                print(f"Capture error: {e}")
-                self.root.after(
-                    0, lambda: self.text_label.config(text=f"Error: {err[:60]}")
-                )
+            log.error(f"Capture error: {e}")
+            self.root.after(
+                0, lambda: self.text_label.config(text=f"Error: {str(e)[:60]}")
+            )
 
         elapsed = time.time() - t0
-        print(f"Capture done: {chunks_sent} chunks ({bytes_sent / 1024:.0f} KB) in {elapsed:.1f}s")
+        log.info(
+            f"Capture complete: {chunks_sent} chunks "
+            f"({bytes_sent / 1024:.0f} KB) in {elapsed:.1f}s"
+        )
+
+    # --- Transcription Handling ---
 
     def _insert_text(self, text: str):
-        """Copy text to clipboard."""
+        """Copy transcribed text to clipboard."""
         try:
             pyperclip.copy(text)
             display = text[:120] + "..." if len(text) > 120 else text
@@ -350,8 +421,10 @@ class WhisperFlowClient:
             self.rec_label.config(text="Press Ctrl+V to paste")
             self.record_btn.config(state=tk.NORMAL)
         except Exception as e:
-            self.text_label.config(text=f"Error: {str(e)[:60]}")
+            self.text_label.config(text=f"Clipboard error: {str(e)[:60]}")
             self.record_btn.config(state=tk.NORMAL)
+
+    # --- WebSocket Connection ---
 
     async def _connect(self):
         try:
@@ -361,47 +434,52 @@ class WhisperFlowClient:
                 ping_timeout=10,
             )
             self.is_connected = True
+            log.info("Connected to server")
             self.root.after(0, lambda: self.status_label.config(text="Connected to Cloud"))
             self.root.after(0, lambda: self.record_btn.config(state=tk.NORMAL))
             await self._listen()
         except Exception as e:
             self.is_connected = False
+            log.error(f"Connection failed: {e}")
             self.root.after(
                 0, lambda: self.status_label.config(text=f"Error: {str(e)[:50]}")
             )
 
     async def _listen(self):
+        """Listen for transcription results from server."""
         try:
             async for msg in self.websocket:
                 data = json.loads(msg)
-                if not data["is_partial"]:
-                    text = data["data"]["text"].strip()
-                    if text:
-                        print(f"Transcribed: {text}")
-                        self.root.after(0, lambda t=text: self._insert_text(t))
+                text = data.get("data", {}).get("text", "").strip()
+                if not text:
+                    continue
+
+                if data.get("is_partial"):
+                    self.root.after(
+                        0,
+                        lambda t=text: self.text_label.config(text=f"... {t[:100]}"),
+                    )
                 else:
-                    partial = data["data"]["text"].strip()
-                    if partial:
-                        self.root.after(
-                            0,
-                            lambda t=partial: self.text_label.config(
-                                text=f"... {t[:100]}"
-                            ),
-                        )
+                    log.info(f"Transcribed: {text[:80]}")
+                    self.root.after(0, lambda t=text: self._insert_text(t))
+
         except websockets.exceptions.ConnectionClosed:
-            pass
+            log.info("Server closed connection")
         except Exception as e:
             self.is_connected = False
+            log.error(f"Listen error: {e}")
             self.root.after(
                 0, lambda: self.status_label.config(text=f"Disconnected: {str(e)[:40]}")
             )
             self.root.after(0, lambda: self.record_btn.config(state=tk.DISABLED))
 
+    # --- Lifecycle ---
+
     def _on_close(self):
+        log.info("Shutting down...")
         self.is_recording = False
         if self.audio_source:
             self.audio_source.close()
-        self.pa.terminate()
         if self.websocket:
             asyncio.run_coroutine_threadsafe(self.websocket.close(), self.loop)
         self.root.destroy()
@@ -417,12 +495,12 @@ class WhisperFlowClient:
         self.root.mainloop()
 
 
+# =============================================================================
+# Entry Point
+# =============================================================================
+
 def main():
-    print("WhisperFlow Cloud Client starting...")
-    if HAS_WASAPI_LOOPBACK:
-        print("PyAudioWPatch detected - System Audio capture available")
-    else:
-        print("PyAudioWPatch not found - Microphone only (pip install PyAudioWPatch)")
+    log.info("WhisperFlow Cloud Client v2.0 starting...")
     client = WhisperFlowClient()
     client.run()
 
