@@ -6,11 +6,8 @@ Connects via WSS to Cloud Run server.
 """
 
 import asyncio
-import audioop
 import json
 import os
-import queue
-import struct
 import threading
 import time
 import tkinter as tk
@@ -35,6 +32,57 @@ DEFAULT_SERVER = os.getenv(
 )
 AUTH_TOKEN = os.getenv("WHISPERFLOW_AUTH_TOKEN", "")
 TARGET_SAMPLE_RATE = 16000  # OpenAI expects 16kHz mono PCM16
+
+
+def _ws_is_open(ws) -> bool:
+    """Check if websocket is open (compatible with websockets v13-v15+)."""
+    if ws is None:
+        return False
+    # v15+: ClientConnection has no .closed, use .state
+    try:
+        return ws.state.name == "OPEN"
+    except AttributeError:
+        pass
+    # v13 and below: .closed is a bool (True = closed)
+    try:
+        return not ws.closed
+    except AttributeError:
+        return False
+
+
+def _stereo_to_mono(data: bytes) -> bytes:
+    """Convert stereo PCM16 to mono by averaging channels (no audioop)."""
+    samples = len(data) // 4  # 2 bytes per sample, 2 channels
+    mono = bytearray(samples * 2)
+    for i in range(samples):
+        left = int.from_bytes(data[i * 4 : i * 4 + 2], "little", signed=True)
+        right = int.from_bytes(data[i * 4 + 2 : i * 4 + 4], "little", signed=True)
+        avg = (left + right) // 2
+        mono[i * 2 : i * 2 + 2] = avg.to_bytes(2, "little", signed=True)
+    return bytes(mono)
+
+
+def _resample_linear(data: bytes, src_rate: int, dst_rate: int) -> bytes:
+    """Simple linear interpolation resampling for PCM16 mono (no audioop)."""
+    if src_rate == dst_rate:
+        return data
+    src_samples = len(data) // 2
+    ratio = dst_rate / src_rate
+    dst_samples = int(src_samples * ratio)
+    result = bytearray(dst_samples * 2)
+    for i in range(dst_samples):
+        src_pos = i / ratio
+        idx = int(src_pos)
+        frac = src_pos - idx
+        s0 = int.from_bytes(data[idx * 2 : idx * 2 + 2], "little", signed=True)
+        if idx + 1 < src_samples:
+            s1 = int.from_bytes(data[(idx + 1) * 2 : (idx + 1) * 2 + 2], "little", signed=True)
+        else:
+            s1 = s0
+        val = int(s0 + frac * (s1 - s0))
+        val = max(-32768, min(32767, val))
+        result[i * 2 : i * 2 + 2] = val.to_bytes(2, "little", signed=True)
+    return bytes(result)
 
 
 class AudioSource:
@@ -93,13 +141,11 @@ class AudioSource:
 
         # Convert stereo to mono if needed
         if self.channels > 1:
-            raw = audioop.tomono(raw, 2, 1, 1)
+            raw = _stereo_to_mono(raw)
 
         # Resample if source rate differs from 16kHz
         if self.source_rate != TARGET_SAMPLE_RATE:
-            raw, _ = audioop.ratecv(
-                raw, 2, 1, self.source_rate, TARGET_SAMPLE_RATE, None
-            )
+            raw = _resample_linear(raw, self.source_rate, TARGET_SAMPLE_RATE)
 
         return raw
 
@@ -125,7 +171,7 @@ class WhisperFlowClient:
 
         self.is_recording = False
         self.is_connected = False
-        self.websocket: Optional[websockets.WebSocketClientProtocol] = None
+        self.websocket = None
         self.audio_mode = "mic"  # "mic" or "system"
 
         self.pa = pyaudio.PyAudio()
@@ -221,7 +267,7 @@ class WhisperFlowClient:
 
     def _start_recording(self):
         # Reconnect if needed
-        if not self.websocket or self.websocket.closed:
+        if not _ws_is_open(self.websocket):
             self.text_label.config(text="Reconnecting...")
             self.record_btn.config(state=tk.DISABLED)
             asyncio.run_coroutine_threadsafe(self._connect(), self.loop)
@@ -269,7 +315,7 @@ class WhisperFlowClient:
                 bytes_sent += len(chunk)
                 chunks_sent += 1
 
-                if self.websocket and not self.websocket.closed:
+                if _ws_is_open(self.websocket):
                     asyncio.run_coroutine_threadsafe(
                         self.websocket.send(chunk), self.loop
                     )
