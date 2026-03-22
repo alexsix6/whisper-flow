@@ -162,3 +162,5 @@ cython_debug/
 .vscode/
 
 nohup.out
+# Model files (use OpenAI API instead)
+*.pt
