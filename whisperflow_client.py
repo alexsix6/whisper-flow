@@ -18,6 +18,8 @@ import struct
 import sys
 import threading
 import time
+import shutil
+import re
 import subprocess as sp
 
 import customtkinter as ctk
@@ -113,7 +115,7 @@ def _score_device(payload, mode):
         if _is_system(name) or _is_virtual(name) or _is_mapper(name):
             return None
     else:
-        if not _is_system(name):
+        if not (_is_system(name) or _is_virtual(name)):
             return None
 
     score = 0
@@ -134,7 +136,10 @@ def _score_device(payload, mode):
         if "headset" in name or "usb" in name or "cougar" in name:
             score += 30
     else:
-        score += 120
+        if _is_virtual(name):
+            score += 140
+        else:
+            score += 120
 
     score += min(payload["channels"], 2) * 10
     score += min(payload["rate"], 48000) // 1000
@@ -215,31 +220,64 @@ chosen_source = None
 probe_data = None
 failures = []
 target = 16000
-chunk_duration = 2.5
-SILENCE_RMS_THRESHOLD = 50
+is_system_mode = cmd == "system"
+chunk_duration = 4.0 if is_system_mode else 2.5
+SILENCE_RMS_THRESHOLD = 12 if is_system_mode else 50
+TARGET_RMS = 5000.0 if is_system_mode else 3500.0
+MAX_GAIN = 12.0 if is_system_mode else 6.0
+MIN_SIGNAL_PEAK = 120.0 if is_system_mode else 200.0
 
 
 def resample(audio, src_rate, dst_rate):
     if src_rate == dst_rate:
+        return audio.astype(np.float32)
+    if audio.size == 0:
+        return np.array([], dtype=np.float32)
+    n = int(round(len(audio) * dst_rate / src_rate))
+    if n <= 1:
+        return np.array([], dtype=np.float32)
+    src_idx = np.arange(len(audio), dtype=np.float32)
+    dst_idx = np.linspace(0, len(audio) - 1, n, dtype=np.float32)
+    return np.interp(dst_idx, src_idx, audio).astype(np.float32)
+
+
+def rms_level(audio):
+    if audio.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
+
+
+def peak_level(audio):
+    if audio.size == 0:
+        return 0.0
+    return float(np.max(np.abs(audio)))
+
+
+def is_silence(audio):
+    return rms_level(audio) < SILENCE_RMS_THRESHOLD and peak_level(audio) < MIN_SIGNAL_PEAK
+
+
+def normalize_audio(audio):
+    rms = rms_level(audio)
+    peak = peak_level(audio)
+    if rms <= 0.0 or peak <= 0.0:
         return audio
-    ratio = dst_rate / src_rate
-    n = int(len(audio) * ratio)
-    idx = np.clip((np.arange(n) / ratio).astype(int), 0, len(audio) - 1)
-    return audio[idx]
-
-
-def is_silence(pcm_int16):
-    rms = np.sqrt(np.mean(pcm_int16.astype(np.float64) ** 2))
-    return rms < SILENCE_RMS_THRESHOLD
+    gain = min(TARGET_RMS / rms, MAX_GAIN)
+    gain = min(gain, 30000.0 / peak)
+    if gain <= 1.0:
+        return audio
+    return audio * gain
 
 
 def encode_chunk(data, src_rate):
-    pcm = np.asarray(data, dtype=np.int16).reshape(-1)
+    pcm = np.asarray(data, dtype=np.int16).reshape(-1).astype(np.float32)
     if pcm.size == 0 or is_silence(pcm):
         return None
-    audio = pcm.astype(np.float32)
-    audio = resample(audio, src_rate, target)
+    audio = resample(pcm, src_rate, target)
     if audio.size == 0:
+        return None
+    audio = normalize_audio(audio)
+    if is_silence(audio):
         return None
     return np.clip(audio, -32768, 32767).astype(np.int16).tobytes()
 
@@ -316,53 +354,96 @@ except Exception as e:
 
 
 class AudioEngine:
-    """Process-isolated audio capture — parent never imports audio libraries.
-
-    Architecture (solves COM apartment model conflict on Windows 11):
-      Parent process: tkinter GUI + WebSocket (zero audio imports)
-      Child process:  python -c with sounddevice (proven working via MME)
-
-    This works because python -c with sounddevice is the ONLY method
-    verified to reliably capture audio on this Windows 11 system.
-    """
+    """Split capture engine: sounddevice for mic, ffmpeg for system audio."""
 
     CHUNK_BYTES = SAMPLE_RATE * 2  # 1 second of 16kHz mono PCM16
+    SYSTEM_KEYWORDS = ("mezcla", "stereo mix", "loopback", "what u hear")
+    VIRTUAL_KEYWORDS = ("cable", "virtual", "vb-audio")
 
     def __init__(self):
         self.active = False
         self._process = None
+        self._protocol = "framed"
         self._devices = []
+        self._ffmpeg_audio_devices = []
         self._has_system_audio = False
         self._discover()
 
+    def _is_system_name(self, name: str) -> bool:
+        lowered = name.lower()
+        return any(keyword in lowered for keyword in self.SYSTEM_KEYWORDS)
+
+    def _is_virtual_name(self, name: str) -> bool:
+        lowered = name.lower()
+        return any(keyword in lowered for keyword in self.VIRTUAL_KEYWORDS)
+
+    def _discover_sounddevice_devices(self):
+        result = sp.run(
+            [sys.executable, "-c", _AUDIO_SUBPROCESS, "list"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr[:200])
+        data = json.loads(result.stdout)
+        for device in data["devices"]:
+            name_lower = device["name"].lower()
+            is_system = self._is_system_name(name_lower)
+            is_virtual = self._is_virtual_name(name_lower)
+            if is_system:
+                label = "SYSTEM"
+            elif is_virtual:
+                label = "VIRTUAL"
+            else:
+                label = "MIC"
+            if is_system or is_virtual:
+                self._has_system_audio = True
+            self._devices.append(device)
+            log.info(f"  {label}: [{device['index']}] {device['name']} ({device['api']} {device['rate']}Hz)")
+
+    def _discover_ffmpeg_devices(self):
+        ffmpeg_bin = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+        if not ffmpeg_bin:
+            return
+        result = sp.run(
+            [ffmpeg_bin, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            errors="replace",
+        )
+        stderr = result.stderr or ""
+        in_audio_section = False
+        discovered = []
+        for line in stderr.splitlines():
+            if "DirectShow audio devices" in line:
+                in_audio_section = True
+                continue
+            if "DirectShow video devices" in line and in_audio_section:
+                break
+            if not in_audio_section:
+                continue
+            match = re.search(r'"([^"]+)"', line)
+            if match:
+                name = match.group(1).strip()
+                if name and name not in discovered:
+                    discovered.append(name)
+        self._ffmpeg_audio_devices = discovered
+        if discovered:
+            self._has_system_audio = True
+            for name in discovered:
+                log.info(f"  FFMPEG: {name}")
+
     def _discover(self):
-        """Enumerate devices via sounddevice in a subprocess."""
+        """Enumerate devices via sounddevice plus ffmpeg dshow names."""
         log.info("--- Audio Devices ---")
         try:
-            result = sp.run(
-                [sys.executable, "-c", _AUDIO_SUBPROCESS, "list"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode == 0:
-                import json
-                data = json.loads(result.stdout)
-                for d in data["devices"]:
-                    name_lower = d["name"].lower()
-                    is_system = "mezcla" in name_lower or "stereo mix" in name_lower
-                    is_virtual = any(kw in name_lower for kw in ["cable", "virtual", "vb-audio"])
-                    if is_system:
-                        self._has_system_audio = True
-                        label = "SYSTEM"
-                    elif is_virtual:
-                        label = "VIRTUAL"
-                    else:
-                        label = "MIC"
-                    self._devices.append(d)
-                    log.info(f"  {label}: [{d['index']}] {d['name']} ({d['api']} {d['rate']}Hz)")
-            else:
-                log.error(f"Device discovery failed: {result.stderr[:200]}")
-        except Exception as e:
-            log.error(f"Device discovery error: {e}")
+            self._discover_sounddevice_devices()
+        except Exception as exc:
+            log.error(f"Device discovery error: {exc}")
+        try:
+            self._discover_ffmpeg_devices()
+        except Exception as exc:
+            log.warning(f"FFmpeg device discovery error: {exc}")
         log.info("--- End Devices ---")
 
     @property
@@ -376,23 +457,146 @@ class AudioEngine:
         self._start_capture("system")
 
     def _start_capture(self, mode: str):
-        """Launch audio capture subprocess."""
-        log.info(f"Starting audio capture ({mode})...")
+        if mode == "system":
+            self._start_system_capture()
+        else:
+            self._start_microphone_capture()
 
+    def _start_microphone_capture(self):
+        log.info("Starting audio capture (mic)...")
+        self._protocol = "framed"
         self._process = sp.Popen(
-            [sys.executable, "-c", _AUDIO_SUBPROCESS, mode],
+            [sys.executable, "-c", _AUDIO_SUBPROCESS, "mic"],
             stdout=sp.PIPE,
             stderr=sp.PIPE,
         )
+        self._finalize_process_startup()
 
-        # Wait briefly to catch immediate startup failures before a background
-        # stderr reader drains the diagnostic message.
-        import time as _time
-        _time.sleep(1.0)
+    def _pick_override_sounddevice_device(self, override):
+        override = (override or "").strip()
+        if not override:
+            return None
+        if override.isdigit():
+            target = int(override)
+            for device in self._devices:
+                if device["index"] == target:
+                    return device
+            return None
+        needle = override.lower()
+        for device in self._devices:
+            if needle in device["name"].lower():
+                return device
+        return None
+
+    def _pick_override_ffmpeg_device(self, override):
+        override = (override or "").strip()
+        if not override:
+            return None
+        if override.isdigit():
+            sounddevice_match = self._pick_override_sounddevice_device(override)
+            if sounddevice_match is None:
+                log.warning(f"AUDIO_WARN: override device index not found: {override}")
+                return None
+            override = sounddevice_match["name"]
+        needle = override.lower()
+        for name in self._ffmpeg_audio_devices:
+            if needle in name.lower():
+                return name
+        log.warning(f"AUDIO_WARN: override device name not found: {override}")
+        return None
+
+    def _score_ffmpeg_system_device(self, name):
+        lowered = name.lower()
+        if not (self._is_system_name(lowered) or self._is_virtual_name(lowered)):
+            return None
+        score = 0
+        if self._is_virtual_name(lowered):
+            if "vb-audio virtual cable" in lowered:
+                score += 600
+            else:
+                score += 520
+        else:
+            score += 400
+        if "stereo mix" in lowered or "mezcla" in lowered:
+            score += 80
+        if "point" in lowered:
+            score -= 50
+        return score
+
+    def _ffmpeg_system_candidates(self):
+        override = self._pick_override_ffmpeg_device(os.getenv("WHISPERFLOW_SYSTEM_DEVICE", ""))
+        ranked = []
+        for name in self._ffmpeg_audio_devices:
+            score = self._score_ffmpeg_system_device(name)
+            if score is not None:
+                ranked.append((score, name))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+
+        candidates = []
+        if override is not None:
+            candidates.append(("override", override))
+        for _, name in ranked:
+            if override is not None and name == override:
+                continue
+            candidates.append(("auto", name))
+        return candidates
+
+    def _start_system_capture(self):
+        log.info("Starting audio capture (system)...")
+        ffmpeg_bin = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+        if not ffmpeg_bin:
+            raise RuntimeError("ffmpeg not found in PATH")
+        if not self._ffmpeg_audio_devices:
+            raise RuntimeError("ffmpeg dshow returned no audio devices")
+
+        failures = []
+        for source, device_name in self._ffmpeg_system_candidates():
+            cmd = [
+                ffmpeg_bin,
+                "-hide_banner",
+                "-nostdin",
+                "-loglevel",
+                "warning",
+                "-f",
+                "dshow",
+                "-i",
+                f"audio={device_name}",
+                "-ac",
+                "1",
+                "-ar",
+                str(SAMPLE_RATE),
+                "-f",
+                "s16le",
+                "pipe:1",
+            ]
+            try:
+                process = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
+                time.sleep(1.2)
+                if process.poll() is not None:
+                    err = process.stderr.read().decode(errors="replace").strip()
+                    failures.append(f"{device_name}: {err[:160]}")
+                    log.warning(f"AUDIO_WARN: rejected {device_name}: {err[:160]}")
+                    continue
+
+                self._protocol = "raw"
+                self._process = process
+                threading.Thread(target=self._read_stderr, daemon=True).start()
+                self.active = True
+                log.info(f"AUDIO_DEVICE: {source} -> {device_name} (ffmpeg dshow)")
+                log.warning("[audio] AUDIO_FORMAT: ffmpeg dshow raw 16000Hz mono")
+                log.info(f"Audio subprocess running (PID {self._process.pid})")
+                return
+            except Exception as exc:
+                failures.append(f"{device_name}: {exc}")
+                log.warning(f"AUDIO_WARN: rejected {device_name}: {exc}")
+
+        raise RuntimeError("System audio backend failed: " + " | ".join(failures[:4]))
+
+    def _finalize_process_startup(self):
+        time.sleep(1.0)
         if self._process.poll() is not None:
             err = self._process.stderr.read().decode(errors="replace").strip()
             raise RuntimeError(f"Audio subprocess failed: {err[:200]}")
-
         threading.Thread(target=self._read_stderr, daemon=True).start()
         self.active = True
         log.info(f"Audio subprocess running (PID {self._process.pid})")
@@ -421,6 +625,13 @@ class AudioEngine:
             self.active = False
             return b""
         try:
+            if self._protocol == "raw":
+                data = self._process.stdout.read(self.CHUNK_BYTES)
+                if not data or len(data) < self.CHUNK_BYTES:
+                    self.active = False
+                    return b""
+                return data
+
             header = self._process.stdout.read(4)
             if not header or len(header) < 4:
                 self.active = False
@@ -431,8 +642,8 @@ class AudioEngine:
                 self.active = False
                 return b""
             return data
-        except Exception as e:
-            log.error(f"Pipe error: {e}")
+        except Exception as exc:
+            log.error(f"Pipe error: {exc}")
             self.active = False
             return b""
 
