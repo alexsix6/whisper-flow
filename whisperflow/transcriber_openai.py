@@ -1,4 +1,4 @@
-"""OpenAI Whisper API Transcriber"""
+"""OpenAI Speech-to-Text Transcriber (gpt-4o-mini-transcribe)"""
 
 import os
 import io
@@ -7,6 +7,10 @@ import logging
 from openai import OpenAI, AsyncOpenAI
 
 logging.basicConfig(level=logging.INFO)
+
+# gpt-4o-mini-transcribe: better accuracy than whisper-1, auto language detection,
+# lower cost than gpt-4o-transcribe. Supports same /v1/audio/transcriptions API.
+MODEL = os.getenv("WHISPERFLOW_MODEL", "gpt-4o-mini-transcribe")
 
 client = None
 async_client = None
@@ -22,7 +26,7 @@ def initialize_openai_client(api_key: str = None):
 
     client = OpenAI(api_key=key)
     async_client = AsyncOpenAI(api_key=key)
-    logging.info("OpenAI client initialized")
+    logging.info(f"OpenAI client initialized (model: {MODEL})")
     return True
 
 
@@ -31,7 +35,7 @@ def _pcm_to_wav(audio_bytes: bytes, sample_rate: int = 16000) -> io.BytesIO:
     wav_buffer = io.BytesIO()
     with wave.open(wav_buffer, "wb") as wav_file:
         wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)  # 16-bit
+        wav_file.setsampwidth(2)
         wav_file.setframerate(sample_rate)
         wav_file.writeframes(audio_bytes)
     wav_buffer.seek(0)
@@ -40,7 +44,7 @@ def _pcm_to_wav(audio_bytes: bytes, sample_rate: int = 16000) -> io.BytesIO:
 
 
 def transcribe_pcm_chunks_openai(chunks: list, language=None) -> dict:
-    """Sync transcription using OpenAI Whisper API."""
+    """Sync transcription using OpenAI API."""
     global client
     if not client:
         raise RuntimeError("OpenAI client not initialized")
@@ -48,10 +52,10 @@ def transcribe_pcm_chunks_openai(chunks: list, language=None) -> dict:
     audio_bytes = b"".join(chunks)
     wav_buffer = _pcm_to_wav(audio_bytes)
 
-    logging.info(f"Sending {len(audio_bytes)} bytes to OpenAI API...")
+    logging.info(f"Sending {len(audio_bytes)} bytes ({MODEL})...")
 
     request = {
-        "model": "whisper-1",
+        "model": MODEL,
         "file": wav_buffer,
         "response_format": "json",
     }
@@ -60,9 +64,9 @@ def transcribe_pcm_chunks_openai(chunks: list, language=None) -> dict:
 
     transcript = client.audio.transcriptions.create(**request)
 
-    detected_language = getattr(transcript, "language", None) or language or "auto"
-    logging.info(f"Transcription complete: {len(transcript.text)} chars ({detected_language})")
-    return {"text": transcript.text, "language": detected_language}
+    detected = getattr(transcript, "language", None) or language or "auto"
+    logging.info(f"Transcribed: {len(transcript.text)} chars ({detected})")
+    return {"text": transcript.text, "language": detected}
 
 
 async def transcribe_pcm_chunks_openai_async(chunks: list, language=None) -> dict:
@@ -74,10 +78,10 @@ async def transcribe_pcm_chunks_openai_async(chunks: list, language=None) -> dic
     audio_bytes = b"".join(chunks)
     wav_buffer = _pcm_to_wav(audio_bytes)
 
-    logging.info(f"Sending {len(audio_bytes)} bytes to OpenAI API (async)...")
+    logging.info(f"Sending {len(audio_bytes)} bytes ({MODEL} async)...")
 
     request = {
-        "model": "whisper-1",
+        "model": MODEL,
         "file": wav_buffer,
         "response_format": "json",
     }
@@ -86,6 +90,6 @@ async def transcribe_pcm_chunks_openai_async(chunks: list, language=None) -> dic
 
     transcript = await async_client.audio.transcriptions.create(**request)
 
-    detected_language = getattr(transcript, "language", None) or language or "auto"
-    logging.info(f"Transcription complete: {len(transcript.text)} chars ({detected_language})")
-    return {"text": transcript.text, "language": detected_language}
+    detected = getattr(transcript, "language", None) or language or "auto"
+    logging.info(f"Transcribed: {len(transcript.text)} chars ({detected})")
+    return {"text": transcript.text, "language": detected}
