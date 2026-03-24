@@ -168,8 +168,10 @@ def _pick_override(payloads, override):
 
 
 def _probe_device(payload):
+    """Quick probe using sd.rec() — the only API that works on Windows 11."""
     try:
-        probe_frames = min(int(payload["rate"] * 0.1), 4800)
+        # Record 0.2s to verify device works (short but enough to validate)
+        probe_frames = max(1024, int(payload["rate"] * 0.2))
         audio = sd.rec(
             probe_frames,
             samplerate=payload["rate"],
@@ -244,36 +246,54 @@ chosen = _choose_device(cmd)
 device = chosen["index"]
 rate = chosen["rate"]
 channels = 1
-chunk_frames = max(4096, int(rate * 0.1))
 target = 16000
 
+# 2.5 seconds per chunk — gives OpenAI enough context for accurate transcription
+# (0.1s was causing fragmented, inaccurate results)
+chunk_duration = 2.5
+chunk_frames = int(rate * chunk_duration)
+
+# Silence detection: RMS threshold below which we skip sending
+# Prevents OpenAI from hallucinating on silent/near-silent audio
+SILENCE_RMS_THRESHOLD = 50  # int16 scale (0-32768)
+
+def resample(audio, src_rate, dst_rate):
+    if src_rate == dst_rate:
+        return audio
+    ratio = dst_rate / src_rate
+    n = int(len(audio) * ratio)
+    # Nearest-neighbor for speed (quality loss minimal at 44.1k->16k)
+    idx = np.clip((np.arange(n) / ratio).astype(int), 0, len(audio) - 1)
+    return audio[idx]
+
+def is_silence(pcm_int16):
+    rms = np.sqrt(np.mean(pcm_int16.astype(np.float64) ** 2))
+    return rms < SILENCE_RMS_THRESHOLD
+
 try:
-    # CRITICAL: Use sd.rec() not sd.InputStream().
-    # sd.InputStream fails on Windows 11 due to PortAudio COM conflict.
-    # sd.rec() is the ONLY sounddevice API verified working on this system.
     sys.stderr.write(
-        f"AUDIO_FORMAT: device={device} rate={rate} channels={channels} frames={chunk_frames}\n"
+        f"AUDIO_FORMAT: device={device} rate={rate} ch={channels} "
+        f"chunk={chunk_duration}s ({chunk_frames} frames)\n"
     )
+    sys.stderr.flush()
+
     while True:
         data = sd.rec(chunk_frames, samplerate=rate, channels=channels,
                       dtype="int16", device=device)
         sd.wait()
 
-        audio = data.astype(np.float32)
-        if channels > 1:
-            audio = audio.mean(axis=1)
-        else:
-            audio = audio.flatten()
+        pcm = data.flatten()
 
-        if rate != target:
-            ratio = target / rate
-            n = int(len(audio) * ratio)
-            idx = np.arange(n) / ratio
-            audio = audio[np.clip(idx.astype(int), 0, len(audio) - 1)]
+        # Skip silence — avoids OpenAI hallucinations on empty audio
+        if is_silence(pcm):
+            continue
 
-        pcm = np.clip(audio, -32768, 32767).astype(np.int16).tobytes()
-        sys.stdout.buffer.write(struct.pack("<I", len(pcm)))
-        sys.stdout.buffer.write(pcm)
+        audio = pcm.astype(np.float32)
+        audio = resample(audio, rate, target)
+        out = np.clip(audio, -32768, 32767).astype(np.int16).tobytes()
+
+        sys.stdout.buffer.write(struct.pack("<I", len(out)))
+        sys.stdout.buffer.write(out)
         sys.stdout.buffer.flush()
 except KeyboardInterrupt:
     pass
