@@ -1,5 +1,6 @@
 """ WhisperFlow Cloud - FastAPI WebSocket Server """
 
+import json
 import logging
 import os
 import hmac
@@ -19,6 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 AUTH_TOKEN = os.getenv("WHISPERFLOW_AUTH_TOKEN", "")
 ALLOWED_ORIGINS = os.getenv("WHISPERFLOW_ALLOWED_ORIGINS", "*").split(",")
+
 
 # --- Lifespan ---
 @asynccontextmanager
@@ -63,7 +65,6 @@ def verify_token(token: str) -> bool:
 async def websocket_endpoint(websocket: WebSocket, token: str = Query(default="")):
     """WebSocket endpoint for real-time audio transcription via OpenAI API."""
 
-    # Auth check before accepting connection
     if not verify_token(token):
         await websocket.close(code=4001, reason="Unauthorized")
         logging.warning(f"Rejected unauthorized WebSocket from {websocket.client.host}")
@@ -76,36 +77,89 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(default=""
         try:
             await websocket.send_json(data)
         except Exception:
-            pass  # Client disconnected
+            pass
 
     session = None
     session_id = None
-    try:
-        await websocket.accept()
+
+    async def start_session():
+        nonlocal session, session_id
+        if session is not None:
+            return
         session = st.TranscribeSession(transcribe_async, send_back_async)
         session_id = session.id
         sessions[session_id] = session
         logging.info(f"Session {session_id} started from {websocket.client.host}")
+        try:
+            await websocket.send_json({"type": "session_started", "session_id": str(session_id)})
+        except Exception:
+            pass
+
+    async def stop_session(notify: bool):
+        nonlocal session, session_id
+        current_session = session
+        current_session_id = session_id
+        session = None
+        session_id = None
+
+        if current_session is not None:
+            try:
+                await current_session.stop()
+            except Exception as exc:
+                logging.error(f"Session {current_session_id} stop failed: {exc}")
+            sessions.pop(current_session_id, None)
+            logging.info(f"Session {current_session_id} closed ({len(sessions)} active)")
+
+        if notify:
+            try:
+                await websocket.send_json({"type": "session_stopped"})
+            except Exception:
+                pass
+
+    try:
+        await websocket.accept()
 
         while True:
-            data = await websocket.receive_bytes()
-            if data:
-                session.add_chunk(data)
+            message = await websocket.receive()
+            msg_type = message.get("type")
+
+            if msg_type == "websocket.disconnect":
+                raise WebSocketDisconnect()
+
+            data = message.get("bytes")
+            if data is not None:
+                if session is None:
+                    await start_session()
+                if data:
+                    session.add_chunk(data)
+                continue
+
+            raw_text = message.get("text")
+            if raw_text is None:
+                continue
+
+            try:
+                payload = json.loads(raw_text)
+            except json.JSONDecodeError:
+                logging.warning("Ignoring non-JSON websocket text frame")
+                continue
+
+            control = payload.get("type")
+            if control == "stop":
+                await stop_session(notify=True)
+            elif control == "start":
+                await start_session()
+            elif control == "ping":
+                await websocket.send_json({"type": "pong"})
             else:
-                break
+                logging.warning(f"Ignoring unknown websocket control frame: {control}")
 
     except WebSocketDisconnect:
         logging.info(f"Session {session_id} client disconnected")
     except Exception as e:
         logging.error(f"Session {session_id}: {e}")
     finally:
-        if session and session_id in sessions:
-            try:
-                await session.stop()
-            except Exception:
-                pass
-            sessions.pop(session_id, None)
-        logging.info(f"Session {session_id} closed ({len(sessions)} active)")
+        await stop_session(notify=False)
 
 
 # --- Health Check ---

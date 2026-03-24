@@ -155,6 +155,7 @@ def _pick_override(payloads, override):
             if payload["index"] == target:
                 return payload
         sys.stderr.write(f"AUDIO_WARN: override device index not found: {override}\n")
+        sys.stderr.flush()
         return None
 
     needle = override.lower()
@@ -163,22 +164,11 @@ def _pick_override(payloads, override):
             return payload
 
     sys.stderr.write(f"AUDIO_WARN: override device name not found: {override}\n")
+    sys.stderr.flush()
     return None
 
 
-def _probe_device(payload):
-    """Non-destructive probe: verify device exists without consuming audio."""
-    try:
-        # Just verify the device is queryable (no actual recording)
-        info = sd.query_devices(payload["index"])
-        if info["max_input_channels"] < 1:
-            return False, "no input channels"
-        return True, None
-    except Exception as exc:
-        return False, str(exc)
-
-
-def _choose_device(mode):
+def _candidate_devices(mode):
     payloads = [
         _device_payload(index, device)
         for index, device in enumerate(sd.query_devices())
@@ -205,21 +195,7 @@ def _choose_device(mode):
         if override is not None and payload["index"] == override["index"]:
             continue
         candidates.append(("auto", payload))
-
-    failures = []
-    for source, payload in candidates:
-        ok, error = _probe_device(payload)
-        if ok:
-            sys.stderr.write(
-                f"AUDIO_DEVICE: {source} -> [{payload['index']}] {payload['name']} ({payload['api']} {payload['rate']}Hz)\n"
-            )
-            return payload
-        failures.append(f"[{payload['index']}] {payload['name']}: {error}")
-        sys.stderr.write(
-            f"AUDIO_WARN: rejected [{payload['index']}] {payload['name']}: {error}\n"
-        )
-
-    raise RuntimeError("No working input device found: " + " | ".join(failures[:5]))
+    return candidates
 
 
 cmd = sys.argv[1]  # "list", "mic", or "system"
@@ -233,56 +209,100 @@ if cmd == "list":
     print(json.dumps(result))
     sys.exit(0)
 
-chosen = _choose_device(cmd)
-device = chosen["index"]
-rate = chosen["rate"]
-channels = 1
+candidates = _candidate_devices(cmd)
+chosen = None
+chosen_source = None
+probe_data = None
+failures = []
 target = 16000
-
-# 2.5 seconds per chunk — gives OpenAI enough context for accurate transcription
-# (0.1s was causing fragmented, inaccurate results)
 chunk_duration = 2.5
-chunk_frames = int(rate * chunk_duration)
+SILENCE_RMS_THRESHOLD = 50
 
-# Silence detection: RMS threshold below which we skip sending
-# Prevents OpenAI from hallucinating on silent/near-silent audio
-SILENCE_RMS_THRESHOLD = 50  # int16 scale (0-32768)
 
 def resample(audio, src_rate, dst_rate):
     if src_rate == dst_rate:
         return audio
     ratio = dst_rate / src_rate
     n = int(len(audio) * ratio)
-    # Nearest-neighbor for speed (quality loss minimal at 44.1k->16k)
     idx = np.clip((np.arange(n) / ratio).astype(int), 0, len(audio) - 1)
     return audio[idx]
+
 
 def is_silence(pcm_int16):
     rms = np.sqrt(np.mean(pcm_int16.astype(np.float64) ** 2))
     return rms < SILENCE_RMS_THRESHOLD
 
+
+def encode_chunk(data, src_rate):
+    pcm = np.asarray(data, dtype=np.int16).reshape(-1)
+    if pcm.size == 0 or is_silence(pcm):
+        return None
+    audio = pcm.astype(np.float32)
+    audio = resample(audio, src_rate, target)
+    if audio.size == 0:
+        return None
+    return np.clip(audio, -32768, 32767).astype(np.int16).tobytes()
+
+
+for source, payload in candidates:
+    try:
+        probe_frames = max(1024, int(payload["rate"] * 0.2))
+        probe = sd.rec(
+            probe_frames,
+            samplerate=payload["rate"],
+            channels=1,
+            dtype="int16",
+            device=payload["index"],
+        )
+        sd.wait()
+        if probe is None or len(probe) == 0:
+            raise RuntimeError("empty probe capture")
+        chosen = payload
+        chosen_source = source
+        probe_data = probe
+        break
+    except Exception as exc:
+        failures.append(f"[{payload['index']}] {payload['name']}: {exc}")
+        sys.stderr.write(
+            f"AUDIO_WARN: rejected [{payload['index']}] {payload['name']}: {exc}\n"
+        )
+        sys.stderr.flush()
+
+if chosen is None:
+    raise RuntimeError("No working input device found: " + " | ".join(failures[:5]))
+
+device = chosen["index"]
+rate = chosen["rate"]
+channels = 1
+chunk_frames = int(rate * chunk_duration)
+
 try:
     sys.stderr.write(
-        f"AUDIO_FORMAT: device={device} rate={rate} ch={channels} "
-        f"chunk={chunk_duration}s ({chunk_frames} frames)\n"
+        f"AUDIO_DEVICE: {chosen_source} -> [{chosen['index']}] {chosen['name']} ({chosen['api']} {chosen['rate']}Hz)\n"
+    )
+    sys.stderr.write(
+        f"AUDIO_FORMAT: device={device} rate={rate} ch={channels} chunk={chunk_duration}s ({chunk_frames} frames)\n"
     )
     sys.stderr.flush()
 
+    first_out = encode_chunk(probe_data, rate)
+    if first_out:
+        sys.stdout.buffer.write(struct.pack("<I", len(first_out)))
+        sys.stdout.buffer.write(first_out)
+        sys.stdout.buffer.flush()
+
     while True:
-        data = sd.rec(chunk_frames, samplerate=rate, channels=channels,
-                      dtype="int16", device=device)
+        data = sd.rec(
+            chunk_frames,
+            samplerate=rate,
+            channels=channels,
+            dtype="int16",
+            device=device,
+        )
         sd.wait()
-
-        pcm = data.flatten()
-
-        # Skip silence — avoids OpenAI hallucinations on empty audio
-        if is_silence(pcm):
+        out = encode_chunk(data, rate)
+        if not out:
             continue
-
-        audio = pcm.astype(np.float32)
-        audio = resample(audio, rate, target)
-        out = np.clip(audio, -32768, 32767).astype(np.int16).tobytes()
-
         sys.stdout.buffer.write(struct.pack("<I", len(out)))
         sys.stdout.buffer.write(out)
         sys.stdout.buffer.flush()
@@ -293,6 +313,7 @@ except Exception as e:
     sys.stderr.flush()
     sys.exit(1)
 '''
+
 
 class AudioEngine:
     """Process-isolated audio capture — parent never imports audio libraries.
@@ -460,6 +481,9 @@ class WhisperFlowClient:
         self._timer_id = None
         self._pulse_id = None
         self._pulse_on = True
+        self._stop_timeout_id = None
+        self._awaiting_stop_ack = False
+        self._session_segments = []
         self.engine = AudioEngine()
         self._build_gui()
 
@@ -567,6 +591,16 @@ class WhisperFlowClient:
         self.text_box.insert("1.0", text)
         self.text_box.configure(state="disabled")
 
+    def _render_session_text(self):
+        if self._session_segments:
+            self._set_textbox("\n\n".join(self._session_segments), self.TEXT)
+        else:
+            self._set_textbox("Ready to transcribe", self.DIM)
+
+    def _reset_session(self):
+        self._session_segments = []
+        self._render_session_text()
+
     def _on_space(self):
         if str(self.record_btn.cget("state")) == "normal":
             self._toggle_recording()
@@ -602,6 +636,40 @@ class WhisperFlowClient:
         self._timer_id = self._pulse_id = None
         self.rec_dot.configure(fg_color="transparent")
 
+    def _cancel_stop_timeout(self):
+        if self._stop_timeout_id:
+            self.root.after_cancel(self._stop_timeout_id)
+            self._stop_timeout_id = None
+
+    def _finish_processing(self, label_text, label_color, hint_text=None):
+        self._awaiting_stop_ack = False
+        self._cancel_stop_timeout()
+        self.rec_label.configure(text=label_text, text_color=label_color)
+        self.hint_label.configure(
+            text=hint_text or ("Ctrl+V to paste | Space to record again" if self._session_segments else "Press Space to record")
+        )
+        self.timer_label.configure(text="")
+        self.record_btn.configure(state="normal")
+        self.mode_sel.configure(state="normal")
+
+    def _handle_session_stopped(self):
+        if not self._awaiting_stop_ack:
+            return
+        if self._session_segments:
+            self._finish_processing("Copied to clipboard!", self.GREEN)
+        else:
+            self._finish_processing("No valid transcription received", self.YELLOW)
+
+    def _on_stop_timeout(self):
+        if not self._awaiting_stop_ack:
+            return
+        self._finish_processing("Finalization timeout", self.YELLOW, "Server did not confirm stop; ready to record again")
+
+    def _send_control(self, payload):
+        if not _ws_is_open(self.websocket):
+            return
+        asyncio.run_coroutine_threadsafe(self.websocket.send(json.dumps(payload)), self.loop)
+
     # --- Recording ---
 
     def _toggle_recording(self):
@@ -612,7 +680,7 @@ class WhisperFlowClient:
 
     def _start_recording(self):
         if not _ws_is_open(self.websocket):
-            self._set_textbox("Reconnecting...")
+            self.hint_label.configure(text="Reconnecting...")
             self.record_btn.configure(state="disabled")
             asyncio.run_coroutine_threadsafe(self._connect(), self.loop)
             self.root.after(1500, self._start_recording)
@@ -620,11 +688,13 @@ class WhisperFlowClient:
 
         mode_text = self.mode_var.get()
         mode = "system" if mode_text == "System Audio" else "mic"
+        self._cancel_stop_timeout()
+        self._awaiting_stop_ack = False
+        self._reset_session()
         self.is_recording = True
         self.record_btn.configure(text="STOP", fg_color=self.GREEN, hover_color="#0c8a54")
         self.rec_label.configure(text=f"RECORDING ({mode_text})", text_color=self.RED)
-        self.hint_label.configure(text="Press Space to stop")
-        self._set_textbox("Play audio..." if mode == "system" else "Speak now...", self.TEXT)
+        self.hint_label.configure(text="Play audio..." if mode == "system" else "Speak now...")
         self.mode_sel.configure(state="disabled")
         self._start_timer()
         self._start_pulse()
@@ -660,8 +730,7 @@ class WhisperFlowClient:
         except Exception as e:
             log.error(f"Capture error: {e}")
             err_msg = str(e)[:100]
-            self.root.after(0, lambda m=err_msg: self._set_textbox(f"Audio error: {m}", self.RED))
-            self.root.after(0, lambda: self.rec_label.configure(text=""))
+            self.root.after(0, lambda m=err_msg: self.rec_label.configure(text=f"Audio error: {m}", text_color=self.RED))
             self.root.after(0, lambda: self.record_btn.configure(text="RECORD", fg_color=self.RED, state="normal"))
             self.root.after(0, lambda: self.mode_sel.configure(state="normal"))
             self.root.after(0, lambda: self.hint_label.configure(text="Press Space to record"))
@@ -671,14 +740,18 @@ class WhisperFlowClient:
 
         elapsed = time.time() - t0
         log.info(f"Capture complete: {chunks_sent} chunks ({bytes_sent / 1024:.0f} KB) in {elapsed:.1f}s")
+        if self._awaiting_stop_ack and _ws_is_open(self.websocket):
+            self._send_control({"type": "stop"})
 
     def _stop_recording(self):
         self.is_recording = False
+        self._awaiting_stop_ack = True
+        self._cancel_stop_timeout()
+        self._stop_timeout_id = self.root.after(15000, self._on_stop_timeout)
         self._stop_animations()
         self.record_btn.configure(text="RECORD", fg_color=self.RED, hover_color="#c0392b", state="disabled")
         self.rec_label.configure(text="Processing...", text_color=self.YELLOW)
-        self.hint_label.configure(text="")
-        self._set_textbox("Waiting for transcription...", self.DIM)
+        self.hint_label.configure(text="Finalizing transcription...")
 
     # --- Transcription ---
 
@@ -697,17 +770,14 @@ class WhisperFlowClient:
         return text.strip().lower().rstrip(".!") in self.HALLUCINATIONS
 
     def _append_text(self, text):
-        """Append transcription to the session buffer (accumulative)."""
-        self.text_box.configure(state="normal", text_color=self.TEXT)
-        current = self.text_box.get("1.0", "end").strip()
-        if current and current not in ("Ready to transcribe", "Speak now...", "Play audio...",
-                                        "Waiting for transcription..."):
-            self.text_box.insert("end", " " + text)
-        else:
-            self.text_box.delete("1.0", "end")
-            self.text_box.insert("1.0", text)
-        self.text_box.see("end")
-        self.text_box.configure(state="disabled")
+        """Append a final transcription segment to the session buffer."""
+        normalized = " ".join(text.split()).strip()
+        if not normalized:
+            return
+        if self._session_segments and self._session_segments[-1] == normalized:
+            return
+        self._session_segments.append(normalized)
+        self._render_session_text()
 
     def _insert_text(self, text):
         """Handle a final (non-partial) transcription segment."""
@@ -716,22 +786,21 @@ class WhisperFlowClient:
             return
 
         self._append_text(text)
-
-        # Copy full accumulated text to clipboard
-        self.text_box.configure(state="normal")
-        full_text = self.text_box.get("1.0", "end").strip()
-        self.text_box.configure(state="disabled")
+        full_text = "\n\n".join(self._session_segments).strip()
 
         try:
             pyperclip.copy(full_text)
-            self.rec_label.configure(text="Copied to clipboard!", text_color=self.GREEN)
-            self.hint_label.configure(text="Ctrl+V to paste | Space to record again")
-            self.record_btn.configure(state="normal")
-            self.mode_sel.configure(state="normal")
+            if self.is_recording:
+                mode_text = self.mode_var.get()
+                self.rec_label.configure(text=f"RECORDING ({mode_text})", text_color=self.RED)
+                self.hint_label.configure(text="Press Space to stop")
+            elif not self._awaiting_stop_ack:
+                self._finish_processing("Copied to clipboard!", self.GREEN)
         except Exception as e:
             self.rec_label.configure(text=f"Clipboard error: {str(e)[:40]}", text_color=self.RED)
-            self.record_btn.configure(state="normal")
-            self.mode_sel.configure(state="normal")
+            if not self.is_recording and not self._awaiting_stop_ack:
+                self.record_btn.configure(state="normal")
+                self.mode_sel.configure(state="normal")
 
     # --- WebSocket ---
 
@@ -754,19 +823,29 @@ class WhisperFlowClient:
         try:
             async for msg in self.websocket:
                 data = json.loads(msg)
+                if data.get("type") == "session_started":
+                    continue
+                if data.get("type") == "session_stopped":
+                    self.root.after(0, self._handle_session_stopped)
+                    continue
                 text = data.get("data", {}).get("text", "").strip()
                 if not text:
                     continue
                 if data.get("is_partial"):
-                    # Show partial inline without polluting accumulated text
                     self.root.after(
-                        0, lambda t=text: self.rec_label.configure(
-                            text=f"... {t[:60]}", text_color=self.DIM))
+                        0, lambda t=text: self.hint_label.configure(text=f"... {t[:80]}")
+                    )
                 else:
                     log.info(f"Transcribed: {text[:80]}")
                     self.root.after(0, lambda t=text: self._insert_text(t))
         except websockets.exceptions.ConnectionClosed:
+            self.is_connected = False
             log.info("Server closed connection")
+            self.root.after(0, lambda: self._set_status("Disconnected", self.RED))
+            if self._awaiting_stop_ack:
+                self.root.after(0, lambda: self._finish_processing("Connection closed before final confirmation", self.YELLOW))
+            else:
+                self.root.after(0, lambda: self.record_btn.configure(state="disabled"))
         except Exception as e:
             self.is_connected = False
             err_msg = str(e)[:40]
