@@ -39,7 +39,7 @@ def _pcm_to_wav(audio_bytes: bytes, sample_rate: int = 16000) -> io.BytesIO:
     return wav_buffer
 
 
-def transcribe_pcm_chunks_openai(chunks: list, language="es") -> dict:
+def transcribe_pcm_chunks_openai(chunks: list, language=None) -> dict:
     """Sync transcription using OpenAI Whisper API."""
     global client
     if not client:
@@ -50,18 +50,22 @@ def transcribe_pcm_chunks_openai(chunks: list, language="es") -> dict:
 
     logging.info(f"Sending {len(audio_bytes)} bytes to OpenAI API...")
 
-    transcript = client.audio.transcriptions.create(
-        model="whisper-1",
-        file=wav_buffer,
-        language=language,
-        response_format="json",
-    )
+    request = {
+        "model": "whisper-1",
+        "file": wav_buffer,
+        "response_format": "json",
+    }
+    if language:
+        request["language"] = language
 
-    logging.info(f"Transcription complete: {len(transcript.text)} chars")
-    return {"text": transcript.text, "language": language}
+    transcript = client.audio.transcriptions.create(**request)
+
+    detected_language = getattr(transcript, "language", None) or language or "auto"
+    logging.info(f"Transcription complete: {len(transcript.text)} chars ({detected_language})")
+    return {"text": transcript.text, "language": detected_language}
 
 
-async def transcribe_pcm_chunks_openai_async(chunks: list, language="es") -> dict:
+async def transcribe_pcm_chunks_openai_async(chunks: list, language=None) -> dict:
     """Async transcription using AsyncOpenAI client."""
     global async_client
     if not async_client:
@@ -72,12 +76,16 @@ async def transcribe_pcm_chunks_openai_async(chunks: list, language="es") -> dic
 
     logging.info(f"Sending {len(audio_bytes)} bytes to OpenAI API (async)...")
 
-    transcript = await async_client.audio.transcriptions.create(
-        model="whisper-1",
-        file=wav_buffer,
-        language=language,
-        response_format="json",
-    )
+    request = {
+        "model": "whisper-1",
+        "file": wav_buffer,
+        "response_format": "json",
+    }
+    if language:
+        request["language"] = language
 
-    logging.info(f"Transcription complete: {len(transcript.text)} chars")
-    return {"text": transcript.text, "language": language}
+    transcript = await async_client.audio.transcriptions.create(**request)
+
+    detected_language = getattr(transcript, "language", None) or language or "auto"
+    logging.info(f"Transcription complete: {len(transcript.text)} chars ({detected_language})")
+    return {"text": transcript.text, "language": detected_language}

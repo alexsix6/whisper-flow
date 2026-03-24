@@ -71,7 +71,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(default=""
         return
 
     async def transcribe_async(chunks: list):
-        return await ts_openai.transcribe_pcm_chunks_openai_async(chunks, language="es")
+        return await ts_openai.transcribe_pcm_chunks_openai_async(chunks)
 
     async def send_back_async(data: dict):
         try:
