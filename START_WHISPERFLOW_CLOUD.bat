@@ -14,13 +14,14 @@ set WHISPERFLOW_SERVER=wss://whisperflow-server-518312107738.us-central1.run.app
 echo Server: %WHISPERFLOW_SERVER%
 echo.
 
-REM Run with Python from PATH
-python whisperflow_client.py
+cd /d "%~dp0"
+python -c "exec(open('whisperflow_client.py').read())"
 
 if %ERRORLEVEL% NEQ 0 (
     echo.
-    echo ERROR: Failed to start. Make sure Python and dependencies are installed:
-    echo   pip install PyAudioWPatch websockets pyperclip
+    echo ERROR: Install dependencies:
+    echo   pip install sounddevice numpy websockets pyperclip
+echo   This client no longer depends on soundcard.
     echo.
     pause
 )
