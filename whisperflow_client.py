@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-WhisperFlow Cloud Client v3.0 — Enterprise-Grade Windows Native
+WhisperFlow Cloud Client v3.1 — Enterprise-Grade Windows Native
 
 Audio engine: isolated `sounddevice` subprocess.
 The GUI process never imports audio libraries directly, which avoids
@@ -21,7 +21,6 @@ import time
 import subprocess as sp
 
 import customtkinter as ctk
-tk = ctk
 import pyperclip
 import websockets
 
@@ -168,20 +167,12 @@ def _pick_override(payloads, override):
 
 
 def _probe_device(payload):
-    """Quick probe using sd.rec() — the only API that works on Windows 11."""
+    """Non-destructive probe: verify device exists without consuming audio."""
     try:
-        # Record 0.2s to verify device works (short but enough to validate)
-        probe_frames = max(1024, int(payload["rate"] * 0.2))
-        audio = sd.rec(
-            probe_frames,
-            samplerate=payload["rate"],
-            channels=1,
-            dtype="int16",
-            device=payload["index"],
-        )
-        sd.wait()
-        if audio is None or len(audio) == 0:
-            raise RuntimeError("empty probe capture")
+        # Just verify the device is queryable (no actual recording)
+        info = sd.query_devices(payload["index"])
+        if info["max_input_channels"] < 1:
+            return False, "no input channels"
         return True, None
     except Exception as exc:
         return False, str(exc)
@@ -492,7 +483,7 @@ class WhisperFlowClient:
         ctk.CTkLabel(hdr, text="CLOUD", font=("Segoe UI", 11, "bold"),
                      text_color=self.RED, anchor="s"
                      ).pack(side="left", padx=(6, 0), pady=(14, 0))
-        ctk.CTkLabel(hdr, text="v3.0", font=("Segoe UI", 9),
+        ctk.CTkLabel(hdr, text="v3.1", font=("Segoe UI", 9),
                      text_color=self.MUTED, anchor="se"
                      ).pack(side="right", pady=(18, 0))
 
@@ -691,17 +682,54 @@ class WhisperFlowClient:
 
     # --- Transcription ---
 
+    # Known Whisper hallucinations on silence/near-silence
+    HALLUCINATIONS = {
+        "subtítulos realizados por la comunidad de amara.org",
+        "subtitulos realizados por la comunidad de amara.org",
+        "thanks for watching",
+        "thank you for watching",
+        "gracias por ver",
+        "suscríbete",
+        "you",
+    }
+
+    def _is_hallucination(self, text: str) -> bool:
+        return text.strip().lower().rstrip(".!") in self.HALLUCINATIONS
+
+    def _append_text(self, text):
+        """Append transcription to the session buffer (accumulative)."""
+        self.text_box.configure(state="normal", text_color=self.TEXT)
+        current = self.text_box.get("1.0", "end").strip()
+        if current and current not in ("Ready to transcribe", "Speak now...", "Play audio...",
+                                        "Waiting for transcription..."):
+            self.text_box.insert("end", " " + text)
+        else:
+            self.text_box.delete("1.0", "end")
+            self.text_box.insert("1.0", text)
+        self.text_box.see("end")
+        self.text_box.configure(state="disabled")
+
     def _insert_text(self, text):
+        """Handle a final (non-partial) transcription segment."""
+        if self._is_hallucination(text):
+            log.info(f"Filtered hallucination: {text}")
+            return
+
+        self._append_text(text)
+
+        # Copy full accumulated text to clipboard
+        self.text_box.configure(state="normal")
+        full_text = self.text_box.get("1.0", "end").strip()
+        self.text_box.configure(state="disabled")
+
         try:
-            pyperclip.copy(text)
-            self._set_textbox(text, self.TEXT)
+            pyperclip.copy(full_text)
             self.rec_label.configure(text="Copied to clipboard!", text_color=self.GREEN)
             self.hint_label.configure(text="Ctrl+V to paste | Space to record again")
-            self.timer_label.configure(text="")
             self.record_btn.configure(state="normal")
             self.mode_sel.configure(state="normal")
         except Exception as e:
-            self._set_textbox(f"Clipboard error: {str(e)[:60]}", self.RED)
+            self.rec_label.configure(text=f"Clipboard error: {str(e)[:40]}", text_color=self.RED)
             self.record_btn.configure(state="normal")
             self.mode_sel.configure(state="normal")
 
@@ -730,7 +758,10 @@ class WhisperFlowClient:
                 if not text:
                     continue
                 if data.get("is_partial"):
-                    self.root.after(0, lambda t=text: self._set_textbox(f"... {t[:150]}", self.DIM))
+                    # Show partial inline without polluting accumulated text
+                    self.root.after(
+                        0, lambda t=text: self.rec_label.configure(
+                            text=f"... {t[:60]}", text_color=self.DIM))
                 else:
                     log.info(f"Transcribed: {text[:80]}")
                     self.root.after(0, lambda t=text: self._insert_text(t))
@@ -770,7 +801,7 @@ class WhisperFlowClient:
 # =============================================================================
 
 def main():
-    log.info("WhisperFlow Cloud Client v3.0 starting...")
+    log.info("WhisperFlow Cloud Client v3.1 starting...")
     log.info("Audio engine: isolated sounddevice subprocess")
     client = WhisperFlowClient()
     client.run()

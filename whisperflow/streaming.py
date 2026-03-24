@@ -21,25 +21,36 @@ async def transcribe(
     transcriber: Callable[[list], str],
     segment_closed: Callable[[dict], None],
 ):
-    """the transcription loop"""
+    """Transcription loop with final flush on stop."""
     window, prev_result, cycles = [], {}, 0
 
-    while not should_stop[0]:
+    while True:
+        stopping = should_stop[0]
         start = time.time()
         await asyncio.sleep(0.01)
         window.extend(get_all(queue))
+
+        # If stopping and no remaining audio, exit
+        if stopping and not window:
+            break
 
         if not window:
             continue
 
         try:
             result = {
-                "is_partial": True,
+                "is_partial": not stopping,  # Final chunk on stop = not partial
                 "data": await transcriber(window),
                 "time": (time.time() - start) * 1000,
             }
 
-            if should_close_segment(result, prev_result, cycles):
+            if stopping:
+                # Flush: send everything as final segment and exit
+                result["is_partial"] = False
+                if result["data"]["text"]:
+                    await segment_closed(result)
+                break
+            elif should_close_segment(result, prev_result, cycles):
                 window, prev_result, cycles = [], {}, 0
                 result["is_partial"] = False
             elif result["data"]["text"] == prev_result.get("data", {}).get("text", ""):
@@ -48,30 +59,31 @@ async def transcribe(
                 cycles = 0
                 prev_result = result
 
-            if result["data"]["text"]:
+            if not stopping and result["data"]["text"]:
                 await segment_closed(result)
 
         except Exception as e:
-            # Manejar errores de transcripción (ej: audio demasiado corto)
             error_msg = str(e)
             if "audio_too_short" in error_msg or "too short" in error_msg.lower():
+                if stopping:
+                    break  # Don't error on final flush if audio too short
                 error_result = {
                     "is_partial": False,
-                    "data": {"text": "⚠️ Audio muy corto - Habla por al menos 1 segundo"},
+                    "data": {"text": ""},
                     "error": "audio_too_short",
                     "time": (time.time() - start) * 1000,
                 }
             else:
                 error_result = {
                     "is_partial": False,
-                    "data": {"text": f"❌ Error de transcripción: {error_msg[:100]}"},
+                    "data": {"text": f"Error: {error_msg[:100]}"},
                     "error": "transcription_error",
                     "time": (time.time() - start) * 1000,
                 }
-            # Enviar error al cliente
             await segment_closed(error_result)
-            # Limpiar ventana y continuar
             window, prev_result, cycles = [], {}, 0
+            if stopping:
+                break
 
 
 def should_close_segment(result: dict, prev_result: dict, cycles, max_cycles=1):
