@@ -43,7 +43,7 @@ def _pcm_to_wav(audio_bytes: bytes, sample_rate: int = 16000) -> io.BytesIO:
     return wav_buffer
 
 
-def transcribe_pcm_chunks_openai(chunks: list, language=None) -> dict:
+def transcribe_pcm_chunks_openai(chunks: list, language=None, prompt=None) -> dict:
     """Sync transcription using OpenAI API."""
     global client
     if not client:
@@ -61,6 +61,8 @@ def transcribe_pcm_chunks_openai(chunks: list, language=None) -> dict:
     }
     if language:
         request["language"] = language
+    if prompt:
+        request["prompt"] = prompt
 
     transcript = client.audio.transcriptions.create(**request)
 
@@ -69,7 +71,7 @@ def transcribe_pcm_chunks_openai(chunks: list, language=None) -> dict:
     return {"text": transcript.text, "language": detected}
 
 
-async def transcribe_pcm_chunks_openai_async(chunks: list, language=None) -> dict:
+async def transcribe_pcm_chunks_openai_async(chunks: list, language=None, prompt=None) -> dict:
     """Async transcription using AsyncOpenAI client."""
     global async_client
     if not async_client:
@@ -87,6 +89,8 @@ async def transcribe_pcm_chunks_openai_async(chunks: list, language=None) -> dic
     }
     if language:
         request["language"] = language
+    if prompt:
+        request["prompt"] = prompt
 
     transcript = await async_client.audio.transcriptions.create(**request)
 

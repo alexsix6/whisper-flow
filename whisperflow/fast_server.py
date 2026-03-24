@@ -51,6 +51,15 @@ app.add_middleware(
 )
 
 sessions = {}
+MAX_PROMPT_CHARS = int(os.getenv("WHISPERFLOW_PROMPT_CHARS", "400"))
+
+
+def _append_prompt(prompt: str, text: str) -> str:
+    cleaned = " ".join((text or "").split())
+    if not cleaned:
+        return prompt
+    merged = f"{prompt} {cleaned}".strip() if prompt else cleaned
+    return merged[-MAX_PROMPT_CHARS:]
 
 
 def verify_token(token: str) -> bool:
@@ -71,9 +80,23 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(default=""
         return
 
     async def transcribe_async(chunks: list):
-        return await ts_openai.transcribe_pcm_chunks_openai_async(chunks)
+        return await ts_openai.transcribe_pcm_chunks_openai_async(
+            chunks,
+            language=session_context["language"],
+            prompt=session_context["prompt"] or None,
+        )
 
     async def send_back_async(data: dict):
+        payload = data.get("data") or {}
+        is_partial = data.get("is_partial", False)
+        detected_language = payload.get("language")
+        if detected_language and detected_language != "auto" and not is_partial:
+            session_context["language"] = detected_language
+
+        text_value = (payload.get("text") or "").strip()
+        if text_value and not is_partial:
+            session_context["prompt"] = _append_prompt(session_context["prompt"], text_value)
+
         try:
             await websocket.send_json(data)
         except Exception:
@@ -81,11 +104,14 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(default=""
 
     session = None
     session_id = None
+    session_context = {"language": None, "prompt": ""}
 
     async def start_session():
         nonlocal session, session_id
         if session is not None:
             return
+        session_context["language"] = None
+        session_context["prompt"] = ""
         session = st.TranscribeSession(transcribe_async, send_back_async)
         session_id = session.id
         sessions[session_id] = session
