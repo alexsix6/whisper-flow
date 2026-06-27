@@ -48,8 +48,14 @@ error. No runtime change was required. **Reroll:** v1 used Starlette `TestClient
 which passed locally but HUNG in an external Codex audit (`anyio.start_blocking_portal`
 is non-deterministic on WSL/DrvFs); v2 is portal-free (httpx `ASGITransport` +
 direct `lifespan` + raw-ASGI websocket driver), stable across repeated runs.
-Full default gate: `13 passed, 1 skipped, 5 deselected`. Transversal lesson in
-enterprise_memory `3b619d42-be74-40e5-a337-e6732374a2de`.
+Transversal lesson in enterprise_memory `3b619d42-be74-40e5-a337-e6732374a2de`.
+
+Post-close hardening (commit `d456ccb`): the **entire test suite is now
+TestClient-free** — the integration `test_ws` (test_streaming.py) and
+`test_fast_api` (utils.py) were removed as superseded by the portal-free contract,
+and a portal-free lifespan happy-path test preserves startup coverage. No
+`starlette.testclient` / `anyio.start_blocking_portal` anywhere, even in
+deselected tests. Default gate: `14 passed, 1 skipped, 4 deselected`.
 
 **All technical phases (WF-P0.0, WF-P0.1, WF-P1.1, WF-P2.1) are closed and
 persistence-verified.** The only remaining task is **`WF-P3.1`** (manual Windows
