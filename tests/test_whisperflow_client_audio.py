@@ -60,6 +60,45 @@ def test_ffmpeg_device_discovery_parses_directshow_alternative_names(monkeypatch
     assert engine.has_system_audio is True
 
 
+def test_ffmpeg_device_discovery_parses_inline_audio_tag_format(monkeypatch):
+    """ffmpeg >=7/8 lists devices inline as "(audio)"/"(video)"/"(none)" with no
+    section headers; the parser must still capture audio devices AND their
+    alternative names (capturing by friendly name alone fails on these builds)."""
+    client = import_client(monkeypatch)
+    engine = make_engine(client)
+    dshow_output = (
+        '[in#0 @ 0x1] "Iriun Webcam" (video)\n'
+        '[in#0 @ 0x1]   Alternative name "@device_pnp_cam"\n'
+        '[in#0 @ 0x1] "OBS Virtual Camera" (none)\n'
+        '[in#0 @ 0x1]   Alternative name "@device_sw_obs"\n'
+        '[in#0 @ 0x1] "Mezcla estéreo (Realtek(R) Audio)" (audio)\n'
+        '[in#0 @ 0x1]   Alternative name "@device_cm_{GUID}\\wave_{stereo}"\n'
+        '[in#0 @ 0x1] "CABLE Output (VB-Audio Virtual Cable)" (audio)\n'
+        '[in#0 @ 0x1]   Alternative name "@device_cm_{GUID}\\wave_{cable}"\n'
+    )
+
+    monkeypatch.setattr(client.shutil, "which", lambda _: "ffmpeg")
+    monkeypatch.setattr(
+        client.sp,
+        "run",
+        lambda *args, **kwargs: types.SimpleNamespace(stdout="", stderr=dshow_output),
+    )
+
+    engine._discover_ffmpeg_devices()
+
+    assert engine._ffmpeg_audio_devices == [
+        {
+            "name": "Mezcla estéreo (Realtek(R) Audio)",
+            "alt": "@device_cm_{GUID}\\wave_{stereo}",
+        },
+        {
+            "name": "CABLE Output (VB-Audio Virtual Cable)",
+            "alt": "@device_cm_{GUID}\\wave_{cable}",
+        },
+    ]
+    assert engine.has_system_audio is True
+
+
 def test_ffmpeg_system_candidates_prefer_virtual_alt_name_and_honor_override(
     monkeypatch,
 ):
