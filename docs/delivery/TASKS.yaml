@@ -1,0 +1,309 @@
+# TDC Task Queue - WhisperFlow production readiness.
+# Companion of RUNBOOK.md.
+# Helper: python3 .claude/scripts/delivery/tdc_next.py --tasks-file docs/delivery/TASKS.yaml
+# Status vocabulary: pending | done | hold | blocked | needs_reroll | failed
+
+metadata:
+  name: "WhisperFlow production readiness"
+  updated: "2026-06-27"
+  branch: "spike/realtime-asr-benchmark"
+  checkpoint: "e44f6f3"
+  runbook: docs/delivery/RUNBOOK.md
+  helper: .claude/scripts/delivery/tdc_next.py
+  note: "Tracks the fixes and validation gates required before a production GO."
+
+global_guardrails:
+  - no_deploy_without_explicit_go
+  - no_paid_run_without_explicit_budget_go
+  - no_push_without_explicit_go
+  - no_git_add_a
+  - do_not_touch_dirty_preexisting_paths
+  - separate_business_commits_from_test_commits
+  - keep_default_tests_off_network_and_off_hardware
+  - production_go_requires_real_windows_and_cloud_smoke_evidence
+
+dirty_preexisting_paths:
+  - .agent/
+  - .claude/doc/ultrathink_audio_error_resolution.md
+  - COMO_USAR_RESTAURADO.md
+  - FIX_ERROR_9999.md
+  - START_DICTADO_FIXED.sh
+  - START_DICTADO_FIXED.sh.bak-1761891116
+  - benchmarks/
+  - dictation_gui.py.backup-20251031-010526
+  - dictation_gui.py.backup-20251031-010559
+  - dictation_gui.py.backup-final-fix
+
+tasks:
+  - id: WF-P0.0
+    title: Baseline audit and adopt-or-defer pre-TDC diff
+    status: done
+    completed_checkpoints: []
+    closed_report: docs/delivery/close/WF-P0.0.md
+    priority: P0
+    phase: baseline
+    type: audit
+    owner: unassigned
+    parallel_safe: false
+    test_strategy: not_applicable
+    test_rationale: read-only baseline and scope decision; evidence is documented in PHASE_CLOSE
+    tests: []
+    touches:
+      - docs/delivery/RUNBOOK.md
+      - docs/delivery/TASKS.yaml
+      - docs/delivery/close/WF-P0.0.md
+    reads:
+      - whisperflow_client.py
+      - tests/test_whisperflow_client_audio.py
+      - tests/test_transcriber.py
+      - tests/test_streaming.py
+      - tests/benchmark/test_benchmark.py
+      - tests/audio/test_audio.py
+      - tests/utils.py
+      - git status --short
+      - git diff -- whisperflow_client.py tests/test_whisperflow_client_audio.py
+    blocked_by: []
+    can_run_with: []
+    must_not_run_with:
+      - WF-P0.1
+      - WF-P1.1
+      - WF-P2.1
+    guardrails:
+      - read_only_except_tdc_close
+      - classify_existing_dirty_paths_before_editing
+      - no_runtime_changes
+      - no_push
+    commands:
+      - git status --short
+      - git diff -- whisperflow_client.py tests/test_whisperflow_client_audio.py
+      - python3 .claude/scripts/delivery/tdc_next.py --tasks-file docs/delivery/TASKS.yaml --guardrails
+    acceptance:
+      - current dirty work is classified as in-scope candidate work or do-not-touch unrelated work
+      - production readiness gaps are mapped to task ownership
+      - next actionable task is confirmed by the helper
+    outputs:
+      - PHASE_CLOSE report for WF-P0.0
+    next_on_success:
+      - WF-P0.1
+    notes:
+      - whisperflow_client.py and tests/test_whisperflow_client_audio.py are pre-TDC candidate work and must be reviewed before adoption.
+
+  - id: WF-P0.1
+    title: Make the default test suite collect and run without external dependencies
+    status: done
+    completed_checkpoints: []
+    closed_report: docs/delivery/close/WF-P0.1.md
+    priority: P0
+    phase: test_infra
+    type: test
+    owner: unassigned
+    parallel_safe: false
+    test_strategy: functional
+    tests:
+      - .venv/bin/python -m pytest --collect-only -q
+      - .venv/bin/python -m pytest tests/test_whisperflow_client_audio.py tests/test_chat_room.py -q
+      - git diff --check
+    touches:
+      - tests/test_transcriber.py
+      - tests/test_streaming.py
+      - tests/benchmark/test_benchmark.py
+      - tests/audio/test_audio.py
+      - tests/utils.py
+      - docs/delivery/RUNBOOK.md
+      - docs/delivery/TASKS.yaml
+      - docs/delivery/close/WF-P0.1.md
+    reads:
+      - whisperflow/fast_server.py
+      - whisperflow/transcriber_openai.py
+      - whisperflow/streaming.py
+      - whisperflow/audio/microphone.py
+      - requirements.txt
+      - requirements-client.txt
+      - requirements-server.txt
+    blocked_by:
+      - WF-P0.0
+    can_run_with: []
+    must_not_run_with:
+      - WF-P1.1
+      - WF-P2.1
+    guardrails:
+      - no_network_in_default_tests
+      - no_real_audio_hardware_in_default_tests
+      - no_openai_api_calls_in_default_tests
+      - keep_benchmarks_out_of_default_unit_gate
+      - no_push
+    commands:
+      - .venv/bin/python -m pytest tests/test_transcriber.py -q
+      - .venv/bin/python -m pytest tests/test_streaming.py -q
+      - .venv/bin/python -m pytest tests/benchmark/test_benchmark.py -q
+      - .venv/bin/python -m pytest --collect-only -q
+      - git diff --check
+    acceptance:
+      - missing whisperflow.transcriber imports are removed or replaced with mocked OpenAI-era tests
+      - benchmark or localhost-server tests are marked integration or otherwise excluded from the default gate
+      - hardware-dependent audio tests skip cleanly when PyAudio or devices are unavailable
+      - default collection completes without hanging
+    outputs:
+      - test-infra changes
+      - PHASE_CLOSE report for WF-P0.1
+    next_on_success:
+      - WF-P1.1
+    notes:
+      - Existing observed failures: whisperflow.transcriber missing; benchmark sockets to localhost:8181 are not default-unit-safe.
+
+  - id: WF-P1.1
+    title: Harden Windows FFmpeg DirectShow client capture and unit coverage
+    status: done
+    completed_checkpoints: []
+    closed_report: docs/delivery/close/WF-P1.1.md
+    priority: P0
+    phase: client_hardening
+    type: runtime
+    owner: unassigned
+    parallel_safe: false
+    test_strategy: functional
+    tests:
+      - .venv/bin/python -m pytest tests/test_whisperflow_client_audio.py -q
+      - .venv/bin/python -m py_compile whisperflow_client.py tests/test_whisperflow_client_audio.py
+      - git diff --check
+    touches:
+      - whisperflow_client.py
+      - tests/test_whisperflow_client_audio.py
+      - docs/delivery/RUNBOOK.md
+      - docs/delivery/TASKS.yaml
+      - docs/delivery/close/WF-P1.1.md
+    reads:
+      - requirements-client.txt
+      - README.md
+      - START_WHISPERFLOW_CLOUD.bat
+    blocked_by:
+      - WF-P0.1
+    can_run_with: []
+    must_not_run_with:
+      - WF-P2.1
+    guardrails:
+      - review_pre_tdc_directshow_diff_before_adopting
+      - no_windows_assumptions_without_test_or_smoke_evidence
+      - no_deploy
+      - no_push
+    commands:
+      - .venv/bin/python -m pytest tests/test_whisperflow_client_audio.py -q
+      - .venv/bin/python -m py_compile whisperflow_client.py tests/test_whisperflow_client_audio.py
+      - .venv/bin/python -m black --check tests/test_whisperflow_client_audio.py
+      - git diff --check
+    acceptance:
+      - DirectShow device discovery parses audio devices and alternative names from stdout or stderr
+      - system candidates prefer VB-Audio or Stereo Mix and honor name, alt-name, and index overrides
+      - startup tries alt names and pin fallback in a deterministic order
+      - stop or failed capture cannot leave the UI permanently disabled
+      - error logs identify ffmpeg missing, no dshow devices, rejected candidates, selected alt name, and selected pin
+    outputs:
+      - client hardening change
+      - focused unit tests
+      - PHASE_CLOSE report for WF-P1.1
+    next_on_success:
+      - WF-P2.1
+    notes:
+      - This task owns the current pre-TDC whisperflow_client.py and tests/test_whisperflow_client_audio.py candidate changes.
+
+  - id: WF-P2.1
+    title: Add mocked server contract tests and production config validation
+    status: done
+    completed_checkpoints: []
+    closed_report: docs/delivery/close/WF-P2.1.md
+    reroll_note: "v1 (Starlette TestClient) reopened after external Codex audit found a non-deterministic anyio start_blocking_portal hang on WSL/DrvFs; v2 is portal-free (httpx ASGITransport + direct lifespan + raw-ASGI websocket driver). Re-verified green + persisted (em-id 3b619d42)."
+    priority: P1
+    phase: server_contract
+    type: runtime
+    owner: unassigned
+    parallel_safe: false
+    test_strategy: functional
+    tests:
+      - .venv/bin/python -m pytest tests/test_server_contract.py -q
+      - .venv/bin/python -m pytest --collect-only -q
+      - git diff --check
+    touches:
+      - whisperflow/fast_server.py
+      - whisperflow/transcriber_openai.py
+      - tests/test_server_contract.py
+      - docs/delivery/RUNBOOK.md
+      - docs/delivery/TASKS.yaml
+      - docs/delivery/close/WF-P2.1.md
+    reads:
+      - requirements-server.txt
+      - docker-compose.yml
+      - Dockerfile
+      - start_server.sh
+    blocked_by:
+      - WF-P1.1
+    can_run_with: []
+    must_not_run_with:
+      - WF-P1.1
+    guardrails:
+      - mock_openai_api
+      - no_real_network_calls
+      - no_deploy
+      - no_push
+    commands:
+      - .venv/bin/python -m pytest tests/test_server_contract.py -q
+      - .venv/bin/python -m pytest --collect-only -q
+      - git diff --check
+    acceptance:
+      - health check is covered without requiring a real OpenAI key
+      - websocket start, bytes, stop, and session_stopped contract are covered with mocked transcription
+      - auth token accept and reject paths are covered
+      - required production config errors are explicit and actionable
+    outputs:
+      - server contract tests
+      - any small config-validation fixes needed by the tests
+      - PHASE_CLOSE report for WF-P2.1
+    next_on_success:
+      - WF-P3.1
+    notes:
+      - Do not call OpenAI from tests. Mock whisperflow.transcriber_openai at module boundary.
+
+  - id: WF-P3.1
+    title: Manual production smoke validation on Windows client and Cloud Run server
+    status: hold
+    priority: P1
+    phase: production_smoke
+    type: manual_validation
+    owner: unassigned
+    parallel_safe: false
+    test_strategy: not_applicable
+    test_rationale: external manual validation on Windows audio stack and deployed/cloud endpoint
+    tests: []
+    touches:
+      - docs/delivery/RUNBOOK.md
+      - docs/delivery/TASKS.yaml
+      - docs/delivery/close/WF-P3.1.md
+    reads:
+      - whisperflow_client.py
+      - whisperflow/fast_server.py
+      - docs/delivery/RUNBOOK.md
+    blocked_by:
+      - WF-P2.1
+    can_run_with: []
+    must_not_run_with: []
+    guardrails:
+      - requires_explicit_user_go
+      - no_deploy_without_explicit_go
+      - capture_logs_and_versions
+      - no_paid_run_without_budget_go
+      - no_push
+    commands:
+      - manual Windows smoke: ffmpeg in PATH, System Audio, 10-15 second recording, logs captured
+      - manual Windows smoke: Microphone, 10-15 second recording, transcription captured
+      - manual server smoke: health, websocket with token, websocket without token rejected
+    acceptance:
+      - System Audio logs show AUDIO_DEVICE with selected alt name or default name and selected pin
+      - audio chunks are sent and final transcription is received and copied
+      - Stop returns the UI to a usable state after each mode
+      - deployed server health and websocket auth behavior match the contract
+      - production GO or NO-GO is recorded with evidence
+    outputs:
+      - PHASE_CLOSE report for WF-P3.1
+      - captured smoke evidence linked from the close report
+    next_on_success: []
+    notes:
+      - This remains hold until the user gives explicit GO for external/manual production smoke.
