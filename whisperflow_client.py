@@ -413,20 +413,16 @@ class AudioEngine:
             errors="replace",
         )
         output = "\n".join(part for part in (result.stdout, result.stderr) if part)
-        section = None
         discovered = []
         pending = None
+        section = None  # old ffmpeg: "DirectShow audio/video devices" section headers
         for line in output.splitlines():
             lowered = line.lower()
             if "directshow audio devices" in lowered:
-                section = "audio"
-                pending = None
+                section, pending = "audio", None
                 continue
             if "directshow video devices" in lowered:
-                section = "video"
-                pending = None
-                continue
-            if section != "audio":
+                section, pending = "video", None
                 continue
             match = re.search(r'"([^"]+)"', line)
             if not match:
@@ -434,30 +430,29 @@ class AudioEngine:
             value = match.group(1).strip()
             if not value:
                 continue
+            # Alternative name line (both formats) -> attach to the current device.
             if "alternative name" in lowered:
                 if pending is not None:
                     pending["alt"] = value
                 continue
+            # Device line. ffmpeg >=7/8 tags each device inline as "(audio)" /
+            # "(video)" / "(none)" and emits no section headers; older ffmpeg has
+            # no inline tag and relies on the section header above. Without the
+            # alternative name, dshow capture by friendly name fails on these
+            # builds ("Could not find output pin"), so capturing the alt is what
+            # actually makes System Audio work.
+            stripped = lowered.rstrip()
+            if stripped.endswith("(audio)"):
+                is_audio = True
+            elif stripped.endswith("(video)") or stripped.endswith("(none)"):
+                is_audio = False
+            else:
+                is_audio = section == "audio"
+            if not is_audio:
+                pending = None
+                continue
             pending = {"name": value, "alt": None}
             discovered.append(pending)
-        if not discovered:
-            for line in output.splitlines():
-                lowered = line.lower()
-                if (
-                    "audio" not in lowered
-                    and "vb-audio" not in lowered
-                    and "stereo" not in lowered
-                    and "mezcla" not in lowered
-                ):
-                    continue
-                match = re.search(r'"([^"]+)"', line)
-                if not match:
-                    continue
-                value = match.group(1).strip()
-                if not value:
-                    continue
-                if not any(item["name"] == value for item in discovered):
-                    discovered.append({"name": value, "alt": None})
         self._ffmpeg_audio_devices = discovered
         if discovered:
             self._has_system_audio = True
