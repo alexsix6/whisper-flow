@@ -359,6 +359,7 @@ class AudioEngine:
     CHUNK_BYTES = SAMPLE_RATE * 2  # 1 second of 16kHz mono PCM16
     SYSTEM_KEYWORDS = ("mezcla", "stereo mix", "loopback", "what u hear")
     VIRTUAL_KEYWORDS = ("cable", "virtual", "vb-audio")
+    COMMON_AUDIO_PIN_NAMES = ("Capture", "Audio Out", "Output", "Wave Out", "Render", "Stereo Mix")
 
     def __init__(self):
         self.active = False
@@ -411,27 +412,63 @@ class AudioEngine:
             timeout=10,
             errors="replace",
         )
-        stderr = result.stderr or ""
-        in_audio_section = False
+        output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+        section = None
         discovered = []
-        for line in stderr.splitlines():
-            if "DirectShow audio devices" in line:
-                in_audio_section = True
+        pending = None
+        for line in output.splitlines():
+            lowered = line.lower()
+            if "directshow audio devices" in lowered:
+                section = "audio"
+                pending = None
                 continue
-            if "DirectShow video devices" in line and in_audio_section:
-                break
-            if not in_audio_section:
+            if "directshow video devices" in lowered:
+                section = "video"
+                pending = None
+                continue
+            if section != "audio":
                 continue
             match = re.search(r'"([^"]+)"', line)
-            if match:
-                name = match.group(1).strip()
-                if name and name not in discovered:
-                    discovered.append(name)
+            if not match:
+                continue
+            value = match.group(1).strip()
+            if not value:
+                continue
+            if "alternative name" in lowered:
+                if pending is not None:
+                    pending["alt"] = value
+                continue
+            pending = {"name": value, "alt": None}
+            discovered.append(pending)
+        if not discovered:
+            for line in output.splitlines():
+                lowered = line.lower()
+                if (
+                    "audio" not in lowered
+                    and "vb-audio" not in lowered
+                    and "stereo" not in lowered
+                    and "mezcla" not in lowered
+                ):
+                    continue
+                match = re.search(r'"([^"]+)"', line)
+                if not match:
+                    continue
+                value = match.group(1).strip()
+                if not value:
+                    continue
+                if not any(item["name"] == value for item in discovered):
+                    discovered.append({"name": value, "alt": None})
         self._ffmpeg_audio_devices = discovered
         if discovered:
             self._has_system_audio = True
-            for name in discovered:
-                log.info(f"  FFMPEG: {name}")
+            for item in discovered:
+                if item.get("alt"):
+                    log.info(f"  FFMPEG: {item['name']} | alt={item['alt']}")
+                else:
+                    log.info(f"  FFMPEG: {item['name']}")
+        else:
+            snippet = " | ".join(output.splitlines()[:8])
+            log.warning(f"FFmpeg device discovery returned no audio devices: {snippet[:400]}")
 
     def _discover(self):
         """Enumerate devices via sounddevice plus ffmpeg dshow names."""
@@ -499,14 +536,14 @@ class AudioEngine:
                 return None
             override = sounddevice_match["name"]
         needle = override.lower()
-        for name in self._ffmpeg_audio_devices:
-            if needle in name.lower():
-                return name
+        for item in self._ffmpeg_audio_devices:
+            if needle in item["name"].lower() or needle in (item.get("alt") or "").lower():
+                return item
         log.warning(f"AUDIO_WARN: override device name not found: {override}")
         return None
 
-    def _score_ffmpeg_system_device(self, name):
-        lowered = name.lower()
+    def _score_ffmpeg_system_device(self, item):
+        lowered = item["name"].lower()
         if not (self._is_system_name(lowered) or self._is_virtual_name(lowered)):
             return None
         score = 0
@@ -521,24 +558,40 @@ class AudioEngine:
             score += 80
         if "point" in lowered:
             score -= 50
+        if item.get("alt"):
+            score += 15
         return score
 
     def _ffmpeg_system_candidates(self):
         override = self._pick_override_ffmpeg_device(os.getenv("WHISPERFLOW_SYSTEM_DEVICE", ""))
         ranked = []
-        for name in self._ffmpeg_audio_devices:
-            score = self._score_ffmpeg_system_device(name)
+        for item in self._ffmpeg_audio_devices:
+            score = self._score_ffmpeg_system_device(item)
             if score is not None:
-                ranked.append((score, name))
-        ranked.sort(key=lambda item: item[0], reverse=True)
+                ranked.append((score, item))
+        ranked.sort(key=lambda pair: pair[0], reverse=True)
 
         candidates = []
+        seen = set()
+
+        def add_candidate(source, item, target):
+            key = (item["name"], target)
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append((source, item, target))
+
+        def add_device(source, item):
+            if item.get("alt"):
+                add_candidate(source + ":alt", item, item["alt"])
+            add_candidate(source, item, item["name"])
+
         if override is not None:
-            candidates.append(("override", override))
-        for _, name in ranked:
-            if override is not None and name == override:
+            add_device("override", override)
+        for _, item in ranked:
+            if override is not None and item["name"] == override["name"]:
                 continue
-            candidates.append(("auto", name))
+            add_device("auto", item)
         return candidates
 
     def _start_system_capture(self):
@@ -550,45 +603,61 @@ class AudioEngine:
             raise RuntimeError("ffmpeg dshow returned no audio devices")
 
         failures = []
-        for source, device_name in self._ffmpeg_system_candidates():
-            cmd = [
-                ffmpeg_bin,
-                "-hide_banner",
-                "-nostdin",
-                "-loglevel",
-                "warning",
-                "-f",
-                "dshow",
-                "-i",
-                f"audio={device_name}",
-                "-ac",
-                "1",
-                "-ar",
-                str(SAMPLE_RATE),
-                "-f",
-                "s16le",
-                "pipe:1",
-            ]
-            try:
-                process = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
-                time.sleep(1.2)
-                if process.poll() is not None:
-                    err = process.stderr.read().decode(errors="replace").strip()
-                    failures.append(f"{device_name}: {err[:160]}")
-                    log.warning(f"AUDIO_WARN: rejected {device_name}: {err[:160]}")
-                    continue
+        for source, item, target_name in self._ffmpeg_system_candidates():
+            clean_target = target_name.replace(chr(34), "")
+            spec = f"audio={clean_target}"
+            label = item["name"] if target_name == item["name"] else f"{item['name']} via {target_name}"
+            attempts = [(None, spec)]
+            for pin_name in self.COMMON_AUDIO_PIN_NAMES:
+                attempts.append((pin_name, spec))
+            for pin_name, current_spec in attempts:
+                cmd = [
+                    ffmpeg_bin,
+                    "-hide_banner",
+                    "-nostdin",
+                    "-loglevel",
+                    "warning",
+                    "-f",
+                    "dshow",
+                ]
+                if pin_name is not None:
+                    cmd.extend(["-audio_pin_name", pin_name])
+                cmd.extend([
+                    "-i",
+                    current_spec,
+                    "-ac",
+                    "1",
+                    "-ar",
+                    str(SAMPLE_RATE),
+                    "-f",
+                    "s16le",
+                    "pipe:1",
+                ])
+                try:
+                    process = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
+                    time.sleep(1.2)
+                    if process.poll() is not None:
+                        err = process.stderr.read().decode(errors="replace").strip()
+                        pin_suffix = f" pin={pin_name}" if pin_name is not None else ""
+                        failures.append(f"{label}{pin_suffix}: {err[:160]}")
+                        log.warning(f"AUDIO_WARN: rejected {label} spec={current_spec}{pin_suffix}: {err[:160]}")
+                        continue
 
-                self._protocol = "raw"
-                self._process = process
-                threading.Thread(target=self._read_stderr, daemon=True).start()
-                self.active = True
-                log.info(f"AUDIO_DEVICE: {source} -> {device_name} (ffmpeg dshow)")
-                log.warning("[audio] AUDIO_FORMAT: ffmpeg dshow raw 16000Hz mono")
-                log.info(f"Audio subprocess running (PID {self._process.pid})")
-                return
-            except Exception as exc:
-                failures.append(f"{device_name}: {exc}")
-                log.warning(f"AUDIO_WARN: rejected {device_name}: {exc}")
+                    self._protocol = "raw"
+                    self._process = process
+                    threading.Thread(target=self._read_stderr, daemon=True).start()
+                    self.active = True
+                    if target_name == item["name"]:
+                        log.info(f"AUDIO_DEVICE: {source} -> {item['name']} spec={current_spec} pin={pin_name or 'default'} (ffmpeg dshow)")
+                    else:
+                        log.info(f"AUDIO_DEVICE: {source} -> {item['name']} using alt={target_name} spec={current_spec} pin={pin_name or 'default'} (ffmpeg dshow)")
+                    log.warning("[audio] AUDIO_FORMAT: ffmpeg dshow raw 16000Hz mono")
+                    log.info(f"Audio subprocess running (PID {self._process.pid})")
+                    return
+                except Exception as exc:
+                    pin_suffix = f" pin={pin_name}" if pin_name is not None else ""
+                    failures.append(f"{label}{pin_suffix}: {exc}")
+                    log.warning(f"AUDIO_WARN: rejected {label} spec={current_spec}{pin_suffix}: {exc}")
 
         raise RuntimeError("System audio backend failed: " + " | ".join(failures[:4]))
 
