@@ -7,9 +7,10 @@ import numpy as np
 import whisperflow.audio.microphone as mic
 
 
+@pytest.mark.hardware
 @pytest.mark.asyncio
 async def test_capture_mic():
-    """test capturing microphone"""
+    """test capturing microphone (opens a real PyAudio input device)"""
     stop_event = asyncio.Event()
     audio_chunks = queue.Queue()
 
@@ -40,11 +41,13 @@ def test_is_silent():
     ), "Threshold-level data should not be detected as silent"
 
 
+@pytest.mark.hardware
 @pytest.mark.asyncio
 async def test_play_audio():
     """
     Test the play_audio function by adding dummy audio data to a queue,
     running the function, and ensuring the queue is empty after processing.
+    Opens a real PyAudio output device.
     """
     queue_chunks = queue.Queue()
     stop_event = asyncio.Event()

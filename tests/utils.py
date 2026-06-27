@@ -2,6 +2,7 @@
 
 import os
 import json
+import pytest
 from starlette.testclient import TestClient
 import whisperflow.fast_server as fs
 
@@ -26,8 +27,9 @@ def load_resource(name: str) -> dict:
     return result
 
 
+@pytest.mark.integration
 def test_fast_api():
-    """test health api"""
+    """test health api — boots the server lifespan, which requires OPENAI_API_KEY"""
     with TestClient(fs.app) as client:
         response = client.get("/health")
         assert response.status_code == 200 and bool(response.text)

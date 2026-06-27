@@ -1,76 +1,48 @@
-""" test scenario module """
+""" test streaming module — OpenAI-era safe subset.
+
+The streaming loop (`whisperflow.streaming`) is engine-agnostic, so its unit
+behavior is tested here with a dummy transcriber (no network, no model). The
+in-process websocket path (`test_ws`) boots the FastAPI server lifespan, which
+requires an OpenAI key and would issue real transcription calls, so it is marked
+`integration` and excluded from the default gate. The former
+`test_transcribe_streaming` exercised the removed local Whisper engine
+(`whisperflow.transcriber.get_model`) and was dropped with that engine; see
+`tests/test_transcriber.py` and the WF-P2.1 contract tests.
+"""
 
 import asyncio
 from queue import Queue
 
 import pytest
+
 import tests.utils as ut
 import whisperflow.streaming as st
 import whisperflow.fast_server as fs
-import whisperflow.transcriber as ts
 
 
 @pytest.mark.asyncio
 async def test_simple():
-    """test asyncio"""
+    """streaming.transcribe drains the queue and stops cleanly with a dummy transcriber"""
 
     queue, should_stop = Queue(), [False]
     queue.put(1)
 
     async def dummy_transcriber(items: list) -> dict:
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.01)
         if queue.qsize() == 0:
             should_stop[0] = True
         return {"text": str(len(items))}
 
-    async def dummy_segment_closed(text: str) -> None:
+    async def dummy_segment_closed(_result: dict) -> None:
         await asyncio.sleep(0.01)
-        print(text)
 
     await st.transcribe(should_stop, queue, dummy_transcriber, dummy_segment_closed)
     assert queue.qsize() == 0
 
 
-@pytest.mark.asyncio
-async def test_transcribe_streaming(chunk_size=4096):
-    """test streaming"""
-
-    model = ts.get_model()
-    queue, should_stop = Queue(), [False]
-    res = ut.load_resource("3081-166546-0000")
-    chunks = [
-        res["audio"][i : i + chunk_size]
-        for i in range(0, len(res["audio"]), chunk_size)
-    ]
-
-    async def dummy_transcriber(items: list) -> str:
-        await asyncio.sleep(0.01)
-        result = ts.transcribe_pcm_chunks(model, items)
-        return result
-
-    result = []
-
-    async def dummy_segment_closed(text: str) -> None:
-        await asyncio.sleep(0.01)
-        result.append(text)
-
-    task = asyncio.create_task(
-        st.transcribe(should_stop, queue, dummy_transcriber, dummy_segment_closed)
-    )
-
-    for chunk in chunks:
-        queue.put(chunk)
-        await asyncio.sleep(0.01)
-
-    await asyncio.sleep(1)
-    should_stop[0] = True
-    await task
-
-    assert len(result) > 0
-
-
 def test_streaming():
-    """test hugging face image generation"""
+    """streaming.get_all drains a queue and tolerates None"""
+
     queue = Queue()
     queue.put(1)
     queue.put(2)
@@ -81,10 +53,12 @@ def test_streaming():
     assert not res
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 @pytest.mark.timeout(60)
 async def test_ws(chunk_size=4096):
-    """test health api"""
+    """in-process websocket transcription — boots server lifespan + real OpenAI (integration)"""
+
     client = ut.TestClient(fs.app)
     with client.websocket_connect("/ws") as websocket:
         res = ut.load_resource("3081-166546-0000")

@@ -4,10 +4,15 @@ import json
 import time
 import pandas as pd
 
+import pytest
 import requests
 import jiwer as jw
 import websocket as ws
 import tests.utils as ut
+
+# Whole module needs a live localhost server (ws/http to :8181) — never part of
+# the default unit gate.
+pytestmark = pytest.mark.integration
 
 
 def test_health(url="http://localhost:8181/health"):
