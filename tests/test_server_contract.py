@@ -63,6 +63,22 @@ async def test_missing_openai_key_fails_with_explicit_error(monkeypatch):
             pass
 
 
+@pytest.mark.asyncio
+async def test_lifespan_initializes_client_when_key_present(monkeypatch):
+    """Happy-path startup: with a key, lifespan initializes the OpenAI client and yields."""
+    monkeypatch.setattr(fs, "OPENAI_API_KEY", "test-key")
+    captured = {}
+
+    def fake_init(key=None):
+        captured["key"] = key
+        return True
+
+    monkeypatch.setattr(fs.ts_openai, "initialize_openai_client", fake_init)
+    async with fs.lifespan(fs.app):
+        pass
+    assert captured.get("key") == "test-key"
+
+
 # --- auth accept / reject (pure) ---
 
 

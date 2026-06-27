@@ -1,10 +1,12 @@
-""" test utils class """
+""" test utils — shared resource loaders for the test suite.
+
+Pure helpers only (no `TestClient`): the OpenAI-era server contract — including
+`/health` and the lifespan boot — is covered portably in
+`tests/test_server_contract.py` without Starlette's `TestClient`.
+"""
 
 import os
 import json
-import pytest
-from starlette.testclient import TestClient
-import whisperflow.fast_server as fs
 
 
 def get_resource_path(name: str, extension: str) -> str:
@@ -25,11 +27,3 @@ def load_resource(name: str) -> dict:
         result["expected"] = json.load(file)
 
     return result
-
-
-@pytest.mark.integration
-def test_fast_api():
-    """test health api — boots the server lifespan, which requires OPENAI_API_KEY"""
-    with TestClient(fs.app) as client:
-        response = client.get("/health")
-        assert response.status_code == 200 and bool(response.text)
