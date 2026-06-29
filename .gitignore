@@ -164,3 +164,8 @@ cython_debug/
 nohup.out
 # Model files (use OpenAI API instead)
 *.pt
+
+# Debug capture artifacts (System Audio VB-Cable smoke) — root-anchored so test
+# fixtures (tests/resources/*.wav) stay tracked.
+/debug-wav/
+/whisperflow_system_cable_*.wav

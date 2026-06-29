@@ -304,6 +304,59 @@ tasks:
     outputs:
       - PHASE_CLOSE report for WF-P3.1
       - captured smoke evidence linked from the close report
-    next_on_success: []
+    next_on_success:
+      - WF-P3.2
     notes:
       - This remains hold until the user gives explicit GO for external/manual production smoke.
+      - "PARTIAL FINDING (2026-06-29): Microphone validated GO end-to-end (sounddevice subprocess: chunks sent, real transcription, STOP recovers UI). System Audio via WASAPI loopback / dshow-auto is NO-GO on this Windows: independent probes (PyAudioWPatch Invalid device, soundcard fails, COM/WASAPI LOOPBACK E_INVALIDARG, ffmpeg has no wasapi backend) prove the native loopback stack rejects capture. Server /health + ws auth accept/reject validated. System Audio rerolled to WF-P3.2 (VB-Cable)."
+
+  - id: WF-P3.2
+    title: System Audio via VB-Cable controlled route (opt-in backend)
+    status: done
+    priority: P1
+    phase: system_audio_cable
+    type: runtime
+    owner: unassigned
+    parallel_safe: false
+    test_strategy: functional
+    tests:
+      - .venv/bin/python -m pytest tests/test_whisperflow_client_audio.py -q
+      - .venv/bin/python -m py_compile whisperflow_client.py tests/test_whisperflow_client_audio.py
+      - git diff --check
+    touches:
+      - whisperflow_client.py
+      - tests/test_whisperflow_client_audio.py
+      - docs/delivery/RUNBOOK.md
+      - docs/delivery/TASKS.yaml
+      - docs/delivery/close/WF-P3.2.md
+    reads:
+      - README.md
+      - requirements-client.txt
+    blocked_by: []
+    must_not_run_with:
+      - WF-P1.1
+    guardrails:
+      - opt_in_only_via_WHISPERFLOW_SYSTEM_BACKEND_cable
+      - capture_cable_output_only_no_silent_fallback
+      - rms_peak_gate_fail_fast_on_silence_not_just_bytes
+      - debug_wav_only_on_real_signal
+      - no_auto_output_device_switch_without_explicit_control
+      - real_capture_validation_is_manual_on_windows
+      - no_deploy
+      - no_push
+    acceptance:
+      - opt-in backend WHISPERFLOW_SYSTEM_BACKEND=cable captures ONLY from CABLE Output (VB-Audio Virtual Cable); never silently falls back to Stereo Mix / VB-Audio Point / other silent devices
+      - local RMS/peak gate fails fast with a clear message when captured audio is silence (nothing routed to CABLE Input)
+      - on real signal a debug WAV is written, and only then audio is streamed to the server
+      - unit tests cover backend selection (cable-only, no fallback) and the RMS-gate decision logic with mocks
+      - the WASAPI/dshow-auto System Audio path is marked experimental/non-productive in code + runbook
+      - manual Windows evidence (AUDIO_LEVEL + debug WAV + real transcription) recorded in the close report
+    outputs:
+      - opt-in cable backend + focused unit tests
+      - PHASE_CLOSE report for WF-P3.2 with manual capture evidence (WAV + transcription)
+    next_on_success: []
+    notes:
+      - Reroll of WF-P3.1 System Audio. CABLE Output is a normal capture device (NOT WASAPI loopback), so it sidesteps the broken loopback stack. Route Windows output -> CABLE Input, capture CABLE Output.
+      - Monitoring (play captured audio to the real output so the user hears it) and automatic output-device switch/restore are a deferred, opt-in convenience layer — NOT in this task's minimum.
+      - "Pre-check confirmed (2026-06-29): FFmpeg dshow opens CABLE Output by alt-name and captures real signal (mean_volume -23.3 dB, max_volume -5.1 dB). Python-launched ffmpeg/powershell and sounddevice cannot open CABLE Output on this Windows; reroll supports an external manual FFmpeg writer plus WHISPERFLOW_CABLE_RAW_FILE raw-file reader, still cable-only and opt-in. Integrated cable launch remains best-effort; if startup FFmpeg discovery times out, backend cable retries discovery with a longer timeout; as a controlled fallback, WHISPERFLOW_CABLE_DSHOW_SPEC can pin the exact CABLE Output dshow spec."
+      - "DONE evidence (2026-06-29): external FFmpeg writer -> WHISPERFLOW_CABLE_RAW_FILE reader produced AUDIO_LEVEL rms=2299.3 peak=18408, streamed 65 chunks / 2031 KB in 68.8s, saved debug WAV whisperflow_system_cable_20260629-160752.wav, received real transcription and session_stopped."

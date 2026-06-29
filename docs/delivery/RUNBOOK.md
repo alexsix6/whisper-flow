@@ -57,11 +57,17 @@ and a portal-free lifespan happy-path test preserves startup coverage. No
 `starlette.testclient` / `anyio.start_blocking_portal` anywhere, even in
 deselected tests. Default gate: `14 passed, 1 skipped, 4 deselected`.
 
-**All technical phases (WF-P0.0, WF-P0.1, WF-P1.1, WF-P2.1) are closed and
-persistence-verified.** The only remaining task is **`WF-P3.1`** (manual Windows
-client + Cloud Run smoke), which stays **`hold`** until explicit user GO
-(external/manual, real audio + deployed endpoint, possible paid run). No commit
-yet — commit/push await explicit user GO.
+`WF-P3.2` is **closed (done, 2026-06-29)** — System Audio is validated on the
+real Windows client through the controlled VB-Cable route: external/manual FFmpeg
+dshow writer -> `WHISPERFLOW_CABLE_RAW_FILE` reader, RMS/peak gate, debug WAV,
+streaming, stop/session_stopped, and real transcription. Evidence is in
+`docs/delivery/close/WF-P3.2.md`. Integrated Python-launched DirectShow remains
+best-effort only on this machine because Python-launched `ffmpeg`/PowerShell and
+`sounddevice` cannot open CABLE Output, while direct PowerShell FFmpeg can.
+
+**All technical phases and the VB-Cable System Audio smoke (WF-P0.0, WF-P0.1,
+WF-P1.1, WF-P2.1, WF-P3.2) are closed.** No deploy/push has been done; commit,
+push, and any Cloud Run deployment remain behind explicit GO gates.
 
 ## Non-Negotiable Guardrails
 
@@ -163,8 +169,20 @@ Both Claude Code and Codex read this runbook plus `TASKS.yaml` via
 - Push only after explicit user GO. Pushing to `main` also requires the F1.6
   governance signoff.
 
+## WF-P3.1 / WF-P3.2 smoke finding (2026-06-29)
+
+Microphone is **GO** end-to-end (sounddevice subprocess: chunks sent, real
+transcription, STOP recovers the UI). Server `/health` + websocket auth
+accept/reject **validated**. System Audio is **NO-GO** via WASAPI loopback /
+dshow-auto on the current Windows: independent probes (PyAudioWPatch `Invalid
+device`, `soundcard` fails, COM/WASAPI LOOPBACK `E_INVALIDARG`, local ffmpeg has
+no wasapi backend) prove the native loopback stack rejects capture — not a
+name/index/pin/parser bug. System Audio is rerolled to **`WF-P3.2`** (VB-Cable
+controlled route, opt-in). The default pytest gate no longer hard-requires
+`pytest-timeout` (`--timeout` removed from `addopts`) so it runs in any env.
+
 ## Immediate Next Task
 
 ```text
-WF-P3.1 (HOLD) - Manual production smoke on the Windows client and the Cloud Run server. Requires explicit user GO: real Windows audio (System Audio + Microphone, ffmpeg in PATH, logs captured), and deployed-server health + websocket auth checks. Possible paid run. All technical phases (WF-P0.0/P0.1/P1.1/P2.1) are closed; commit/push of the work also await explicit user GO.
+No actionable TDC task remains after WF-P3.2. Next operational step is review/stage/commit the scoped WF-P3.2 runtime + tests + TDC docs, then decide push/deploy separately under explicit GO gates. No push/deploy has been performed.
 ```
