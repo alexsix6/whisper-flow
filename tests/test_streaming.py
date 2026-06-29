@@ -37,6 +37,43 @@ async def test_simple():
     assert queue.qsize() == 0
 
 
+@pytest.mark.asyncio
+async def test_transcribe_final_only_waits_for_stop_before_transcribing():
+    queue, should_stop = Queue(), [False]
+    queue.put(b"audio-1")
+    calls = []
+    results = []
+
+    async def dummy_transcriber(items: list) -> dict:
+        calls.append(list(items))
+        return {"text": f"final-{len(items)}"}
+
+    async def dummy_segment_closed(result: dict) -> None:
+        results.append(result)
+
+    task = asyncio.create_task(
+        st.transcribe(
+            should_stop,
+            queue,
+            dummy_transcriber,
+            dummy_segment_closed,
+            emit_partials=False,
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert calls == []
+
+    queue.put(b"audio-2")
+    should_stop[0] = True
+    await task
+
+    assert calls == [[b"audio-1", b"audio-2"]]
+    assert len(results) == 1
+    assert results[0]["is_partial"] is False
+    assert results[0]["data"] == {"text": "final-2"}
+    assert results[0]["time"] >= 0
+
+
 def test_streaming():
     """streaming.get_all drains a queue and tolerates None"""
 

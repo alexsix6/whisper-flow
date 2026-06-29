@@ -25,15 +25,35 @@ import whisperflow.fast_server as fs
 
 @pytest.fixture
 def mock_transcriber(monkeypatch):
-    """Replace the OpenAI transcription call with a canned async result."""
+    """Replace OpenAI transcription/translation with canned async results."""
+    calls = {"transcribe": [], "translate": []}
 
     async def fake_transcribe(chunks, language=None, prompt=None):
+        calls["transcribe"].append(
+            {"chunks": chunks, "language": language, "prompt": prompt}
+        )
         return {"text": "hello world", "language": "en"}
 
+    async def fake_translate(
+        text, target_language="Spanish", source_language=None, glossary=None
+    ):
+        calls["translate"].append(
+            {
+                "text": text,
+                "target_language": target_language,
+                "source_language": source_language,
+                "glossary": glossary,
+            }
+        )
+        return {"text": "hola mundo", "language": "es"}
+
+    monkeypatch.setattr(fs, "OUTPUT_LANGUAGE", "es")
+    monkeypatch.setattr(fs, "TRANSLATE_PARTIALS", False)
     monkeypatch.setattr(
         fs.ts_openai, "transcribe_pcm_chunks_openai_async", fake_transcribe
     )
-    return fake_transcribe
+    monkeypatch.setattr(fs.ts_openai, "translate_text_openai_async", fake_translate)
+    return calls
 
 
 # --- /health (no key, no lifespan, no portal) ---
@@ -159,7 +179,9 @@ async def test_ws_rejects_invalid_token(monkeypatch, mock_transcriber):
 
 
 @pytest.mark.asyncio
-async def test_ws_accepts_valid_token_and_runs_stop_contract(monkeypatch, mock_transcriber):
+async def test_ws_accepts_valid_token_and_runs_stop_contract(
+    monkeypatch, mock_transcriber
+):
     monkeypatch.setattr(fs, "AUTH_TOKEN", "secret")
     ws = _ASGIWebSocket(fs.app, _ws_scope(b"token=secret"))
     async with ws:
@@ -175,17 +197,66 @@ async def test_ws_accepts_valid_token_and_runs_stop_contract(monkeypatch, mock_t
 
         types = []
         transcripts = []
+        source_texts = []
+        languages = []
+        partial_flags = []
         for _ in range(30):
             msg = await ws.receive_json()
             types.append(msg.get("type"))
+            if "is_partial" in msg:
+                partial_flags.append(msg["is_partial"])
+            data = msg.get("data") or {}
+            if data.get("text"):
+                transcripts.append(data["text"])
+            if data.get("source_text"):
+                source_texts.append(data["source_text"])
+            if data.get("language"):
+                languages.append(data["language"])
+            if msg.get("type") == "session_stopped":
+                break
+
+    assert "session_stopped" in types
+    assert "hola mundo" in transcripts
+    assert "hello world" in source_texts
+    assert "es" in languages
+    assert partial_flags == [False]
+    assert mock_transcriber["translate"] == [
+        {
+            "text": "hello world",
+            "target_language": "Spanish",
+            "source_language": "en",
+            "glossary": fs.BASE_PROMPT,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ws_output_translation_can_be_disabled(monkeypatch, mock_transcriber):
+    """WHISPERFLOW_OUTPUT_LANGUAGE=off preserves the source-language transcript."""
+    monkeypatch.setattr(fs, "AUTH_TOKEN", "")
+    monkeypatch.setattr(fs, "OUTPUT_LANGUAGE", "off")
+    ws = _ASGIWebSocket(fs.app, _ws_scope())
+    async with ws:
+        assert ws.handshake.get("type") == "websocket.accept"
+
+        await ws.send_json({"type": "start"})
+        started = await ws.receive_json()
+        assert started["type"] == "session_started"
+
+        await ws.send_bytes(b"\x00\x01" * 8000)
+        await ws.send_json({"type": "stop"})
+
+        transcripts = []
+        for _ in range(30):
+            msg = await ws.receive_json()
             data = msg.get("data") or {}
             if data.get("text"):
                 transcripts.append(data["text"])
             if msg.get("type") == "session_stopped":
                 break
 
-    assert "session_stopped" in types
     assert "hello world" in transcripts
+    assert mock_transcriber["translate"] == []
 
 
 @pytest.mark.asyncio
