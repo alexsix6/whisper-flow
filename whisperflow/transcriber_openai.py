@@ -11,6 +11,7 @@ logging.basicConfig(level=logging.INFO)
 # gpt-4o-mini-transcribe: better accuracy than whisper-1, auto language detection,
 # lower cost than gpt-4o-transcribe. Supports same /v1/audio/transcriptions API.
 MODEL = os.getenv("WHISPERFLOW_MODEL", "gpt-4o-mini-transcribe")
+TRANSLATION_MODEL = os.getenv("WHISPERFLOW_TRANSLATION_MODEL", "gpt-4o-mini")
 
 client = None
 async_client = None
@@ -97,3 +98,58 @@ async def transcribe_pcm_chunks_openai_async(chunks: list, language=None, prompt
     detected = getattr(transcript, "language", None) or language or "auto"
     logging.info(f"Transcribed: {len(transcript.text)} chars ({detected})")
     return {"text": transcript.text, "language": detected}
+
+
+async def translate_text_openai_async(
+    text: str,
+    target_language: str = "Spanish",
+    source_language: str | None = None,
+    glossary: str | None = None,
+) -> dict:
+    """Translate transcript text to the configured output language."""
+    global async_client
+    if not async_client:
+        raise RuntimeError("AsyncOpenAI client not initialized")
+
+    source_text = (text or "").strip()
+    if not source_text:
+        return {"text": "", "language": target_language}
+
+    glossary_text = (glossary or "").strip() or "None"
+    source = (source_language or "auto").strip() or "auto"
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Translate transcripts faithfully to the target language. "
+                "Do not summarize, add commentary, or omit content. Preserve names, "
+                "brands, acronyms, commands, code identifiers, and technical terms "
+                "unless they have a natural established translation."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Target language: {target_language}\n"
+                f"Source language: {source}\n"
+                f"Domain glossary: {glossary_text}\n\n"
+                "Transcript:\n"
+                f"{source_text}"
+            ),
+        },
+    ]
+
+    response = await async_client.chat.completions.create(
+        model=TRANSLATION_MODEL,
+        messages=messages,
+        temperature=0,
+    )
+    translated = (response.choices[0].message.content or "").strip()
+    logging.info(
+        "Translated: %s -> %s (%s chars, %s)",
+        source,
+        target_language,
+        len(translated),
+        TRANSLATION_MODEL,
+    )
+    return {"text": translated, "language": target_language}

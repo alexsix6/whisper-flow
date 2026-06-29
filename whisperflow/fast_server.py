@@ -13,6 +13,7 @@ from starlette.websockets import WebSocketDisconnect
 from whisperflow import __version__
 import whisperflow.streaming as st
 import whisperflow.transcriber_openai as ts_openai
+import whisperflow.prompting as prompting
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -20,6 +21,27 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 AUTH_TOKEN = os.getenv("WHISPERFLOW_AUTH_TOKEN", "")
 ALLOWED_ORIGINS = os.getenv("WHISPERFLOW_ALLOWED_ORIGINS", "*").split(",")
+EMIT_PARTIALS = os.getenv("WHISPERFLOW_PARTIALS", "").strip().lower() in {"1", "true", "yes", "on"}
+OUTPUT_LANGUAGE = os.getenv("WHISPERFLOW_OUTPUT_LANGUAGE", "es").strip()
+TRANSLATE_PARTIALS = os.getenv("WHISPERFLOW_TRANSLATE_PARTIALS", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_OFF_VALUES = {"", "off", "0", "false", "no", "none", "disabled"}
+_LANGUAGE_LABELS = {
+    "es": "Spanish",
+    "español": "Spanish",
+    "spanish": "Spanish",
+    "en": "English",
+    "english": "English",
+}
+_LANGUAGE_CODES = {
+    "español": "es",
+    "spanish": "es",
+    "english": "en",
+}
 
 
 # --- Lifespan ---
@@ -35,6 +57,15 @@ async def lifespan(app: FastAPI):
         logging.info("Auth token configured - WebSocket connections require authentication")
     else:
         logging.warning("No WHISPERFLOW_AUTH_TOKEN set - WebSocket is UNAUTHENTICATED")
+
+    if _translation_enabled(is_partial=False):
+        logging.info(
+            "Output translation enabled: target=%s partials=%s",
+            _target_language_label(),
+            TRANSLATE_PARTIALS,
+        )
+    else:
+        logging.info("Output translation disabled")
 
     yield
     logging.info("WhisperFlow shutting down")
@@ -52,6 +83,10 @@ app.add_middleware(
 
 sessions = {}
 MAX_PROMPT_CHARS = int(os.getenv("WHISPERFLOW_PROMPT_CHARS", "400"))
+# Static domain glossary prepended to the transcription prompt (biases vocabulary
+# from the first chunk). Configurable via WHISPERFLOW_PROMPT / WHISPERFLOW_GLOSSARY.
+BASE_PROMPT = prompting.load_base_prompt()
+PROMPT_TOTAL_CHARS = int(os.getenv("WHISPERFLOW_PROMPT_TOTAL_CHARS", "800"))
 
 
 def _append_prompt(prompt: str, text: str) -> str:
@@ -60,6 +95,63 @@ def _append_prompt(prompt: str, text: str) -> str:
         return prompt
     merged = f"{prompt} {cleaned}".strip() if prompt else cleaned
     return merged[-MAX_PROMPT_CHARS:]
+
+
+def _output_language_value() -> str:
+    return (OUTPUT_LANGUAGE or "").strip().lower()
+
+
+def _translation_enabled(is_partial: bool) -> bool:
+    value = _output_language_value()
+    if value in _OFF_VALUES:
+        return False
+    return not is_partial or TRANSLATE_PARTIALS
+
+
+def _target_language_label() -> str:
+    value = _output_language_value()
+    return _LANGUAGE_LABELS.get(value, OUTPUT_LANGUAGE.strip() or "Spanish")
+
+
+def _target_language_code() -> str:
+    value = _output_language_value()
+    return _LANGUAGE_CODES.get(value, value or "es")
+
+
+async def _translate_payload_if_needed(payload: dict, is_partial: bool) -> dict:
+    if not _translation_enabled(is_partial):
+        return payload
+
+    source_text = (payload.get("text") or "").strip()
+    if not source_text:
+        return payload
+
+    source_language = payload.get("language") or "auto"
+    try:
+        translated = await ts_openai.translate_text_openai_async(
+            source_text,
+            target_language=_target_language_label(),
+            source_language=source_language,
+            glossary=BASE_PROMPT,
+        )
+    except Exception as exc:
+        logging.error("Translation failed: %s", exc)
+        enriched = dict(payload)
+        enriched["source_text"] = source_text
+        enriched["source_language"] = source_language
+        enriched["translation_error"] = str(exc)[:300]
+        return enriched
+
+    translated_text = (translated.get("text") or "").strip()
+    if not translated_text:
+        return payload
+
+    enriched = dict(payload)
+    enriched["source_text"] = source_text
+    enriched["source_language"] = source_language
+    enriched["text"] = translated_text
+    enriched["language"] = _target_language_code()
+    return enriched
 
 
 def verify_token(token: str) -> bool:
@@ -80,11 +172,17 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(default=""
         return
 
     async def transcribe_async(chunks: list):
-        return await ts_openai.transcribe_pcm_chunks_openai_async(
+        logging.info(f"Transcribing {len(chunks)} audio chunks (partials={EMIT_PARTIALS})")
+        result = await ts_openai.transcribe_pcm_chunks_openai_async(
             chunks,
             language=session_context["language"],
-            prompt=session_context["prompt"] or None,
+            prompt=prompting.build_prompt(
+                BASE_PROMPT, session_context["prompt"], PROMPT_TOTAL_CHARS
+            )
+            or None,
         )
+        logging.info(f"Transcription complete: {len((result.get('text') or '').strip())} chars")
+        return result
 
     async def send_back_async(data: dict):
         payload = data.get("data") or {}
@@ -96,6 +194,11 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(default=""
         text_value = (payload.get("text") or "").strip()
         if text_value and not is_partial:
             session_context["prompt"] = _append_prompt(session_context["prompt"], text_value)
+
+        translated_payload = await _translate_payload_if_needed(payload, is_partial)
+        if translated_payload is not payload:
+            data = dict(data)
+            data["data"] = translated_payload
 
         try:
             await websocket.send_json(data)
@@ -112,7 +215,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(default=""
             return
         session_context["language"] = None
         session_context["prompt"] = ""
-        session = st.TranscribeSession(transcribe_async, send_back_async)
+        session = st.TranscribeSession(transcribe_async, send_back_async, emit_partials=EMIT_PARTIALS)
         session_id = session.id
         sessions[session_id] = session
         logging.info(f"Session {session_id} started from {websocket.client.host}")

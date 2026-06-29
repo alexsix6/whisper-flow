@@ -20,6 +20,7 @@ async def transcribe(
     queue: Queue,
     transcriber: Callable[[list], str],
     segment_closed: Callable[[dict], None],
+    emit_partials: bool = True,
 ):
     """Transcription loop with final flush on stop."""
     window, prev_result, cycles = [], {}, 0
@@ -35,6 +36,9 @@ async def transcribe(
             break
 
         if not window:
+            continue
+
+        if not stopping and not emit_partials:
             continue
 
         try:
@@ -96,13 +100,21 @@ def should_close_segment(result: dict, prev_result: dict, cycles, max_cycles=1):
 class TranscribeSession:  # pylint: disable=too-few-public-methods
     """transcription state"""
 
-    def __init__(self, transcribe_async, send_back_async) -> None:
+    def __init__(
+        self, transcribe_async, send_back_async, emit_partials: bool = True
+    ) -> None:
         """ctor"""
         self.id = uuid.uuid4()  # pylint: disable=invalid-name
         self.queue = Queue()
         self.should_stop = [False]
         self.task = asyncio.create_task(
-            transcribe(self.should_stop, self.queue, transcribe_async, send_back_async)
+            transcribe(
+                self.should_stop,
+                self.queue,
+                transcribe_async,
+                send_back_async,
+                emit_partials=emit_partials,
+            )
         )
 
     def add_chunk(self, chunk: bytes):
