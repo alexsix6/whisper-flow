@@ -11,15 +11,19 @@ Transport: WSS to Cloud Run with token auth
 """
 
 import asyncio
+import array
 import json
 import logging
+import math
 import os
 import struct
 import sys
+import tempfile
 import threading
 import time
 import shutil
 import re
+import wave
 import subprocess as sp
 
 import customtkinter as ctk
@@ -61,6 +65,58 @@ def _ws_is_open(ws) -> bool:
         return False
 
 
+def _debug_wav_path(mode: str, force: bool = False):
+    value = os.getenv("WHISPERFLOW_DEBUG_WAV", "").strip()
+    if not value and not force:
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    filename = f"whisperflow_{mode}_{stamp}.wav"
+    if not value:
+        return os.path.abspath(filename)
+    if value.lower() in {"1", "true", "yes", "on"}:
+        return os.path.abspath(filename)
+    if value.lower().endswith(".wav"):
+        return os.path.abspath(value)
+    return os.path.abspath(os.path.join(value, filename))
+
+
+def _write_pcm16_wav(path: str, chunks: list[bytes], sample_rate: int = SAMPLE_RATE):
+    if not path or not chunks:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with wave.open(path, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(b"".join(chunks))
+    log.info(f"Debug WAV saved: {path}")
+
+
+def _pcm16_level_values(data: bytes) -> tuple[float, int]:
+    if not data:
+        return 0.0, 0
+    sample_count = len(data) // 2
+    if sample_count <= 0:
+        return 0.0, 0
+    samples = array.array("h")
+    samples.frombytes(data[: sample_count * 2])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    total = 0
+    peak = 0
+    for sample in samples:
+        value = abs(int(sample))
+        total += int(sample) * int(sample)
+        if value > peak:
+            peak = value
+    return math.sqrt(total / sample_count), peak
+
+
+def _pcm16_has_signal(data: bytes, rms_threshold: float = 12.0, peak_threshold: int = 120) -> bool:
+    rms, peak = _pcm16_level_values(data)
+    return rms >= rms_threshold or peak >= peak_threshold
+
+
 # =============================================================================
 # Audio Engine — Isolated subprocess (python -c + sounddevice)
 # =============================================================================
@@ -68,7 +124,9 @@ def _ws_is_open(ws) -> bool:
 # Audio capture subprocess script. Runs in its own python -c process
 # with zero COM conflicts because the parent process never imports audio libs.
 _AUDIO_SUBPROCESS = r'''
-import os, sys, struct, json, sounddevice as sd, numpy as np
+import os, sys, struct, json, time, queue, numpy as np
+
+sd = None
 
 SYSTEM_KEYWORDS = ("mezcla", "stereo mix", "loopback", "what u hear")
 VIRTUAL_KEYWORDS = ("cable", "virtual", "vb-audio")
@@ -181,7 +239,10 @@ def _candidate_devices(mode):
     ]
 
     env_name = "WHISPERFLOW_SYSTEM_DEVICE" if mode == "system" else "WHISPERFLOW_INPUT_DEVICE"
-    override = _pick_override(payloads, os.getenv(env_name, ""))
+    override_value = os.getenv(env_name, "")
+    override = _pick_override(payloads, override_value)
+    if override_value.strip() and override is None:
+        raise RuntimeError(f"Override {env_name}={override_value!r} did not match an input device")
 
     ranked = []
     for payload in payloads:
@@ -195,15 +256,16 @@ def _candidate_devices(mode):
     ranked.sort(key=lambda item: (item[0], item[1]["channels"], item[1]["rate"]), reverse=True)
     candidates = []
     if override is not None:
-        candidates.append(("override", override))
+        return [("override", override)]
     for _, payload in ranked:
-        if override is not None and payload["index"] == override["index"]:
-            continue
         candidates.append(("auto", payload))
     return candidates
 
 
-cmd = sys.argv[1]  # "list", "mic", or "system"
+cmd = sys.argv[1]  # "list", "mic", "system", or "wasapi"
+
+if cmd != "wasapi":
+    import sounddevice as sd
 
 if cmd == "list":
     devices = sd.query_devices()
@@ -214,14 +276,14 @@ if cmd == "list":
     print(json.dumps(result))
     sys.exit(0)
 
-candidates = _candidate_devices(cmd)
+candidates = [] if cmd == "wasapi" else _candidate_devices(cmd)
 chosen = None
 chosen_source = None
 probe_data = None
 failures = []
 target = 16000
-is_system_mode = cmd == "system"
-chunk_duration = 4.0 if is_system_mode else 2.5
+is_system_mode = cmd in ("system", "wasapi")
+chunk_duration = 2.0 if is_system_mode else 2.5
 SILENCE_RMS_THRESHOLD = 12 if is_system_mode else 50
 TARGET_RMS = 5000.0 if is_system_mode else 3500.0
 MAX_GAIN = 12.0 if is_system_mode else 6.0
@@ -253,6 +315,17 @@ def peak_level(audio):
     return float(np.max(np.abs(audio)))
 
 
+def level_values(data):
+    pcm = np.asarray(data, dtype=np.int16).reshape(-1).astype(np.float32)
+    return rms_level(pcm), peak_level(pcm)
+
+
+def log_level(label, data):
+    rms, peak = level_values(data)
+    sys.stderr.write(f"AUDIO_LEVEL: {label} rms={rms:.1f} peak={peak:.0f}\n")
+    sys.stderr.flush()
+
+
 def is_silence(audio):
     return rms_level(audio) < SILENCE_RMS_THRESHOLD and peak_level(audio) < MIN_SIGNAL_PEAK
 
@@ -280,6 +353,144 @@ def encode_chunk(data, src_rate):
     if is_silence(audio):
         return None
     return np.clip(audio, -32768, 32767).astype(np.int16).tobytes()
+
+
+def _wasapi_loopbacks(pa):
+    if hasattr(pa, "get_loopback_device_info_generator"):
+        return list(pa.get_loopback_device_info_generator())
+    loopbacks = []
+    for index in range(pa.get_device_count()):
+        device = pa.get_device_info_by_index(index)
+        if device.get("isLoopbackDevice"):
+            loopbacks.append(device)
+    return loopbacks
+
+
+def _pick_wasapi_loopback(pa, pyaudio):
+    override = os.getenv("WHISPERFLOW_OUTPUT_DEVICE", "").strip()
+    loopbacks = _wasapi_loopbacks(pa)
+    if override:
+        if override.isdigit():
+            target_index = int(override)
+            for device in loopbacks:
+                if int(device["index"]) == target_index:
+                    return device
+        needle = override.lower()
+        for device in loopbacks:
+            if needle in device["name"].lower():
+                return device
+        raise RuntimeError(f"WHISPERFLOW_OUTPUT_DEVICE={override!r} did not match a WASAPI loopback device")
+
+    if hasattr(pa, "get_default_wasapi_loopback"):
+        return pa.get_default_wasapi_loopback()
+
+    wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+    default_output = pa.get_device_info_by_index(wasapi["defaultOutputDevice"])
+    output_name = default_output["name"].lower()
+    for device in loopbacks:
+        device_name = device["name"].lower()
+        if output_name in device_name or device_name in output_name:
+            return device
+    if loopbacks:
+        return loopbacks[0]
+    raise RuntimeError("No WASAPI loopback output device found")
+
+
+def _wasapi_open_stream(pa, pyaudio, device, callback):
+    device_index = int(device["index"])
+    default_rate = int(float(device.get("defaultSampleRate") or 48000))
+    channels = int(device.get("maxInputChannels") or 2)
+
+    failures = []
+    try:
+        stream = pa.open(
+            format=pyaudio.paInt16,
+            channels=channels,
+            rate=default_rate,
+            frames_per_buffer=512,
+            input=True,
+            input_device_index=device_index,
+            stream_callback=callback,
+        )
+        return stream, default_rate, channels, 2.0, int(default_rate * 2.0)
+    except Exception as exc:
+        failures.append(f"rate={default_rate} ch={channels} callback: {exc}")
+        sys.stderr.write(f"AUDIO_WARN: rejected WASAPI callback open rate={default_rate} ch={channels}: {exc}\n")
+        sys.stderr.flush()
+
+    raise RuntimeError("WASAPI loopback open failed: " + " | ".join(failures))
+
+
+def run_wasapi_loopback():
+    try:
+        import pyaudiowpatch as pyaudio
+    except Exception as exc:
+        raise RuntimeError("pyaudiowpatch not installed; run: pip install pyaudiowpatch") from exc
+
+    pa = pyaudio.PyAudio()
+    stream = None
+    try:
+        device = _pick_wasapi_loopback(pa, pyaudio)
+        device_index = int(device["index"])
+        sys.stderr.write(
+            f"AUDIO_DEVICE: wasapi-loopback candidate -> [{device_index}] {device['name']} "
+            f"defaultRate={device.get('defaultSampleRate')} maxIn={device.get('maxInputChannels')} maxOut={device.get('maxOutputChannels')}\n"
+        )
+        sys.stderr.flush()
+        callback_queue = queue.Queue()
+
+        def callback(in_data, frame_count, time_info, status):
+            callback_queue.put(in_data)
+            return (None, pyaudio.paContinue)
+
+        stream, rate, channels, chunk_duration, chunk_frames = _wasapi_open_stream(pa, pyaudio, device, callback)
+        sys.stderr.write(
+            f"AUDIO_DEVICE: wasapi-loopback -> [{device_index}] {device['name']} ({rate}Hz {channels}ch)\n"
+        )
+        sys.stderr.write(
+            f"AUDIO_FORMAT: wasapi loopback rate={rate} ch={channels} chunk={chunk_duration}s ({chunk_frames} frames)\n"
+        )
+        sys.stderr.flush()
+
+        chunk_count = 0
+        sent_count = 0
+        skipped_count = 0
+        bytes_per_frame = channels * 2
+        target_bytes = chunk_frames * bytes_per_frame
+        while True:
+            raw_parts = []
+            total_bytes = 0
+            while total_bytes < target_bytes:
+                part = callback_queue.get(timeout=5)
+                raw_parts.append(part)
+                total_bytes += len(part)
+            raw = b"".join(raw_parts)
+            samples = np.frombuffer(raw, dtype=np.int16)
+            if channels > 1:
+                samples = samples.reshape(-1, channels).astype(np.float32).mean(axis=1).astype(np.int16)
+            chunk_count += 1
+            out = encode_chunk(samples, rate)
+            if not out:
+                skipped_count += 1
+                if skipped_count <= 3 or skipped_count % 5 == 0:
+                    log_level(f"wasapi chunk={chunk_count} skipped", samples)
+                continue
+            sent_count += 1
+            if sent_count <= 3 or sent_count % 5 == 0:
+                log_level(f"wasapi chunk={chunk_count} sent={sent_count} bytes={len(out)}", samples)
+            sys.stdout.buffer.write(struct.pack("<I", len(out)))
+            sys.stdout.buffer.write(out)
+            sys.stdout.buffer.flush()
+    finally:
+        if stream is not None:
+            stream.stop_stream()
+            stream.close()
+        pa.terminate()
+
+
+if cmd == "wasapi":
+    run_wasapi_loopback()
+    sys.exit(0)
 
 
 for source, payload in candidates:
@@ -323,13 +534,20 @@ try:
     )
     sys.stderr.flush()
 
+    if is_system_mode:
+        log_level("probe", probe_data)
+
     first_out = encode_chunk(probe_data, rate)
     if first_out:
         sys.stdout.buffer.write(struct.pack("<I", len(first_out)))
         sys.stdout.buffer.write(first_out)
         sys.stdout.buffer.flush()
 
+    chunk_count = 0
+    sent_count = 1 if first_out else 0
+    skipped_count = 0
     while True:
+        chunk_started = time.time()
         data = sd.rec(
             chunk_frames,
             samplerate=rate,
@@ -338,12 +556,23 @@ try:
             device=device,
         )
         sd.wait()
+        chunk_count += 1
         out = encode_chunk(data, rate)
         if not out:
+            skipped_count += 1
+            if is_system_mode and (skipped_count <= 3 or skipped_count % 5 == 0):
+                log_level(f"chunk={chunk_count} skipped", data)
             continue
+        sent_count += 1
+        if is_system_mode and (sent_count <= 3 or sent_count % 5 == 0):
+            log_level(f"chunk={chunk_count} sent={sent_count} bytes={len(out)}", data)
         sys.stdout.buffer.write(struct.pack("<I", len(out)))
         sys.stdout.buffer.write(out)
         sys.stdout.buffer.flush()
+        if is_system_mode:
+            elapsed = time.time() - chunk_started
+            if elapsed < chunk_duration:
+                time.sleep(chunk_duration - elapsed)
 except KeyboardInterrupt:
     pass
 except Exception as e:
@@ -361,10 +590,30 @@ class AudioEngine:
     VIRTUAL_KEYWORDS = ("cable", "virtual", "vb-audio")
     COMMON_AUDIO_PIN_NAMES = ("Capture", "Audio Out", "Output", "Wave Out", "Render", "Stereo Mix")
 
+    class _ExternalRawFileProcess:
+        pid = "external"
+        stderr = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            return None
+
     def __init__(self):
         self.active = False
         self._process = None
+        self._owns_process = True
         self._protocol = "framed"
+        self._prefetched_chunks = []
+        self._raw_path = None
+        self._raw_file = None
         self._devices = []
         self._ffmpeg_audio_devices = []
         self._has_system_audio = False
@@ -401,15 +650,15 @@ class AudioEngine:
             self._devices.append(device)
             log.info(f"  {label}: [{device['index']}] {device['name']} ({device['api']} {device['rate']}Hz)")
 
-    def _discover_ffmpeg_devices(self):
+    def _discover_ffmpeg_devices(self, timeout=10):
         ffmpeg_bin = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
         if not ffmpeg_bin:
-            return
+            return []
         result = sp.run(
             [ffmpeg_bin, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=timeout,
             errors="replace",
         )
         output = "\n".join(part for part in (result.stdout, result.stderr) if part)
@@ -464,6 +713,7 @@ class AudioEngine:
         else:
             snippet = " | ".join(output.splitlines()[:8])
             log.warning(f"FFmpeg device discovery returned no audio devices: {snippet[:400]}")
+        return discovered
 
     def _discover(self):
         """Enumerate devices via sounddevice plus ffmpeg dshow names."""
@@ -495,14 +745,249 @@ class AudioEngine:
             self._start_microphone_capture()
 
     def _start_microphone_capture(self):
-        log.info("Starting audio capture (mic)...")
+        self._start_sounddevice_capture("mic")
+
+    def _start_sounddevice_capture(self, mode):
+        log.info(f"Starting audio capture ({mode}) via sounddevice...")
         self._protocol = "framed"
         self._process = sp.Popen(
-            [sys.executable, "-c", _AUDIO_SUBPROCESS, "mic"],
+            [sys.executable, "-c", _AUDIO_SUBPROCESS, mode],
             stdout=sp.PIPE,
             stderr=sp.PIPE,
         )
         self._finalize_process_startup()
+
+    def _start_system_sounddevice_capture(self, reason):
+        log.warning(f"AUDIO_WARN: using sounddevice system fallback ({reason})")
+        self._start_sounddevice_capture("system")
+
+    def _start_system_wasapi_capture(self, reason):
+        log.warning(
+            "AUDIO_WARN: WASAPI loopback is experimental/non-productive on this validated Windows setup; "
+            "use WHISPERFLOW_SYSTEM_BACKEND=cable for production System Audio validation"
+        )
+        log.info(f"Starting audio capture (system) via WASAPI loopback ({reason})...")
+        self._protocol = "framed"
+        self._process = sp.Popen(
+            [sys.executable, "-c", _AUDIO_SUBPROCESS, "wasapi"],
+            stdout=sp.PIPE,
+            stderr=sp.PIPE,
+        )
+        self._finalize_process_startup()
+
+    def _is_vb_cable_ffmpeg_device(self, item):
+        lowered = item["name"].lower()
+        return (
+            "cable output" in lowered
+            and "vb-audio virtual cable" in lowered
+            and "point" not in lowered
+        )
+
+    def _pick_ffmpeg_cable_device(self):
+        explicit = os.getenv("WHISPERFLOW_CABLE_DSHOW_SPEC", "").strip()
+        if explicit:
+            lowered = explicit.lower()
+            if "point" in lowered:
+                raise RuntimeError(
+                    "WHISPERFLOW_CABLE_DSHOW_SPEC must target CABLE Output (VB-Audio Virtual Cable), not VB-Audio Point"
+                )
+            spec = explicit if lowered.startswith("audio=") else f"audio={explicit}"
+            target = spec[6:] if spec.lower().startswith("audio=") else spec
+            return {
+                "name": "CABLE Output (VB-Audio Virtual Cable)",
+                "alt": target,
+                "spec": spec,
+                "source": "WHISPERFLOW_CABLE_DSHOW_SPEC",
+            }
+        matches = [
+            item
+            for item in self._ffmpeg_audio_devices
+            if self._is_vb_cable_ffmpeg_device(item)
+        ]
+        if not matches:
+            raise RuntimeError("CABLE Output (VB-Audio Virtual Cable) not found in FFmpeg dshow devices")
+        matches.sort(key=lambda item: 0 if item.get("alt") else 1)
+        return matches[0]
+
+    def _ensure_ffmpeg_cable_device(self):
+        if os.getenv("WHISPERFLOW_CABLE_DSHOW_SPEC", "").strip():
+            return
+        if any(self._is_vb_cable_ffmpeg_device(item) for item in self._ffmpeg_audio_devices):
+            return
+        log.warning("AUDIO_WARN: CABLE Output missing from cached FFmpeg discovery; retrying dshow discovery")
+        try:
+            self._discover_ffmpeg_devices(timeout=30)
+        except Exception as exc:
+            log.warning(f"AUDIO_WARN: FFmpeg dshow rediscovery failed: {exc}")
+
+    def _cable_runtime_paths(self):
+        directory = os.path.join(tempfile.gettempdir(), "whisperflow-cable")
+        os.makedirs(directory, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        stem = f"capture-{os.getpid()}-{stamp}"
+        return os.path.join(directory, stem + ".raw"), os.path.join(directory, stem + ".err")
+
+    def _powershell_double_quote(self, value):
+        return '"' + str(value).replace("`", "``").replace('"', '`"') + '"'
+
+    def _build_cable_powershell_command(self, ffmpeg_bin, spec, raw_path, err_path):
+        powershell_bin = shutil.which("powershell.exe") or shutil.which("powershell") or "powershell.exe"
+        ffmpeg_command = os.getenv("WHISPERFLOW_FFMPEG_COMMAND", "ffmpeg").strip() or "ffmpeg"
+        quoted_spec = self._powershell_double_quote(spec)
+        quoted_raw = self._powershell_double_quote(raw_path)
+        quoted_err = self._powershell_double_quote(err_path)
+        script = (
+            f"{ffmpeg_command} -y -hide_banner -nostdin -loglevel warning "
+            f"-f dshow -i {quoted_spec} -ac 1 -ar {SAMPLE_RATE} -f s16le {quoted_raw} "
+            f"2>{quoted_err}"
+        )
+        return [
+            powershell_bin,
+            "-NoProfile",
+            "-Command",
+            script,
+        ], script
+
+    def _start_cable_ffmpeg_process(self, ffmpeg_bin, spec, raw_path, err_path):
+        cmd, _ = self._build_cable_powershell_command(ffmpeg_bin, spec, raw_path, err_path)
+        return sp.Popen(cmd, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+
+    def _read_cable_error(self, err_path):
+        messages = []
+        if err_path and os.path.exists(err_path):
+            try:
+                with open(err_path, "r", encoding="utf-8", errors="replace") as handle:
+                    messages.append(handle.read())
+            except OSError:
+                pass
+        process = self._process
+        if process and process.stderr and process.poll() is not None:
+            try:
+                messages.append(process.stderr.read().decode(errors="replace"))
+            except Exception:
+                pass
+        return "\n".join(part.strip() for part in messages if part and part.strip())
+
+    def _wait_for_raw_bytes(self, raw_path, byte_count, process=None, timeout=8.0, start_offset=0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if os.path.getsize(raw_path) - start_offset >= byte_count:
+                    return True
+            except OSError:
+                pass
+            if process is not None and process.poll() is not None:
+                return False
+            time.sleep(0.1)
+        return False
+
+    def _start_system_cable_capture(self, reason):
+        log.info(f"Starting audio capture (system) via VB-Cable dshow ({reason})...")
+        external_raw = os.getenv("WHISPERFLOW_CABLE_RAW_FILE", "").strip()
+        if external_raw:
+            self._start_system_cable_file_capture(external_raw, "WHISPERFLOW_CABLE_RAW_FILE")
+            return
+        ffmpeg_bin = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+        if not ffmpeg_bin:
+            raise RuntimeError("ffmpeg not found in PATH")
+        self._ensure_ffmpeg_cable_device()
+        item = self._pick_ffmpeg_cable_device()
+        target_name = item.get("alt") or item["name"]
+        clean_target = target_name.replace(chr(34), "")
+        spec = item.get("spec") or f"audio={clean_target}"
+        raw_path, err_path = self._cable_runtime_paths()
+        process = self._start_cable_ffmpeg_process(ffmpeg_bin, spec, raw_path, err_path)
+        self._process = process
+
+        probe_bytes = self.CHUNK_BYTES * 2
+        if not self._wait_for_raw_bytes(raw_path, probe_bytes, process):
+            err = self._read_cable_error(err_path)
+            self.close()
+            raise RuntimeError(f"CABLE Output dshow open/probe failed: {err[:600]}")
+
+        try:
+            raw_file = open(raw_path, "rb")
+            probe = raw_file.read(probe_bytes)
+        except OSError as exc:
+            self.close()
+            raise RuntimeError(f"CABLE Output dshow probe file failed: {exc}") from exc
+        if len(probe) < probe_bytes:
+            raw_file.close()
+            err = self._read_cable_error(err_path)
+            self.close()
+            raise RuntimeError(f"CABLE Output dshow probe failed: {err[:600]}")
+
+        rms, peak = _pcm16_level_values(probe)
+        log.warning(f"[audio] AUDIO_LEVEL: cable signal-probe rms={rms:.1f} peak={peak}")
+        if not _pcm16_has_signal(probe):
+            raw_file.close()
+            self.close()
+            raise RuntimeError(
+                "CABLE Output is silent; route Windows output to CABLE Input "
+                "(VB-Audio Virtual Cable) and play audio before recording"
+            )
+
+        self._protocol = "file"
+        self._process = process
+        self._raw_path = raw_path
+        self._raw_file = raw_file
+        self._prefetched_chunks = [
+            probe[index : index + self.CHUNK_BYTES]
+            for index in range(0, len(probe), self.CHUNK_BYTES)
+            if len(probe[index : index + self.CHUNK_BYTES]) == self.CHUNK_BYTES
+        ]
+        self.active = True
+        if target_name == item["name"]:
+            log.info(f"AUDIO_DEVICE: cable -> {item['name']} spec={spec} (ffmpeg dshow)")
+        else:
+            log.info(f"AUDIO_DEVICE: cable -> {item['name']} using alt={target_name} spec={spec} (ffmpeg dshow)")
+        log.warning("[audio] AUDIO_FORMAT: ffmpeg dshow raw-file 16000Hz mono")
+        log.info(f"Audio subprocess running (PID {self._process.pid})")
+
+    def _start_system_cable_file_capture(self, raw_path, reason):
+        raw_path = os.path.abspath(raw_path)
+        log.info(f"Starting audio capture (system) via external VB-Cable raw file ({reason})...")
+        probe_bytes = self.CHUNK_BYTES * 2
+        start_offset = os.path.getsize(raw_path) if os.path.exists(raw_path) else 0
+        if not self._wait_for_raw_bytes(raw_path, probe_bytes, None, timeout=10.0, start_offset=start_offset):
+            raise RuntimeError(
+                "External CABLE raw file did not receive audio; start the FFmpeg CABLE Output writer "
+                f"before recording: {raw_path}"
+            )
+
+        try:
+            raw_file = open(raw_path, "rb")
+            raw_file.seek(start_offset)
+            probe = raw_file.read(probe_bytes)
+        except OSError as exc:
+            raise RuntimeError(f"External CABLE raw file failed: {exc}") from exc
+        if len(probe) < probe_bytes:
+            raw_file.close()
+            raise RuntimeError(f"External CABLE raw file probe was incomplete: {raw_path}")
+
+        rms, peak = _pcm16_level_values(probe)
+        log.warning(f"[audio] AUDIO_LEVEL: cable signal-probe rms={rms:.1f} peak={peak}")
+        if not _pcm16_has_signal(probe):
+            raw_file.close()
+            raise RuntimeError(
+                "CABLE Output is silent; route Windows output to CABLE Input "
+                "(VB-Audio Virtual Cable) and play audio before recording"
+            )
+
+        self._protocol = "file"
+        self._process = self._ExternalRawFileProcess()
+        self._owns_process = False
+        self._raw_path = raw_path
+        self._raw_file = raw_file
+        self._prefetched_chunks = [
+            probe[index : index + self.CHUNK_BYTES]
+            for index in range(0, len(probe), self.CHUNK_BYTES)
+            if len(probe[index : index + self.CHUNK_BYTES]) == self.CHUNK_BYTES
+        ]
+        self.active = True
+        log.info(f"AUDIO_DEVICE: cable-file -> CABLE Output (VB-Audio Virtual Cable) raw_file={raw_path}")
+        log.warning("[audio] AUDIO_FORMAT: external ffmpeg dshow raw-file 16000Hz mono")
+        log.info("Audio subprocess running (PID external)")
 
     def _pick_override_sounddevice_device(self, override):
         override = (override or "").strip()
@@ -591,10 +1076,35 @@ class AudioEngine:
 
     def _start_system_capture(self):
         log.info("Starting audio capture (system)...")
+        backend = os.getenv("WHISPERFLOW_SYSTEM_BACKEND", "auto").strip().lower()
+        if backend not in ("auto", "ffmpeg", "sounddevice", "wasapi", "cable"):
+            log.warning(f"AUDIO_WARN: unknown WHISPERFLOW_SYSTEM_BACKEND={backend}; using auto")
+            backend = "auto"
+        if backend in ("auto", "ffmpeg"):
+            log.warning(
+                "AUDIO_WARN: DirectShow/auto System Audio is experimental after WF-P3.1 NO-GO; "
+                "use WHISPERFLOW_SYSTEM_BACKEND=cable for production validation"
+            )
+        if backend == "cable":
+            self._start_system_cable_capture("WHISPERFLOW_SYSTEM_BACKEND=cable")
+            return
+        if backend == "wasapi":
+            self._start_system_wasapi_capture("WHISPERFLOW_SYSTEM_BACKEND=wasapi")
+            return
+        if backend == "sounddevice":
+            self._start_system_sounddevice_capture("WHISPERFLOW_SYSTEM_BACKEND=sounddevice")
+            return
+
         ffmpeg_bin = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
         if not ffmpeg_bin:
+            if backend == "auto":
+                self._start_system_sounddevice_capture("ffmpeg not found in PATH")
+                return
             raise RuntimeError("ffmpeg not found in PATH")
         if not self._ffmpeg_audio_devices:
+            if backend == "auto":
+                self._start_system_sounddevice_capture("ffmpeg dshow returned no audio devices")
+                return
             raise RuntimeError("ffmpeg dshow returned no audio devices")
 
         failures = []
@@ -654,13 +1164,20 @@ class AudioEngine:
                     failures.append(f"{label}{pin_suffix}: {exc}")
                     log.warning(f"AUDIO_WARN: rejected {label} spec={current_spec}{pin_suffix}: {exc}")
 
-        raise RuntimeError("System audio backend failed: " + " | ".join(failures[:4]))
+        ffmpeg_error = "System audio backend failed: " + " | ".join(failures[:4])
+        if backend == "auto":
+            try:
+                self._start_system_sounddevice_capture("ffmpeg dshow could not open a capture pin")
+                return
+            except Exception as exc:
+                raise RuntimeError(f"{ffmpeg_error} | sounddevice fallback failed: {exc}") from exc
+        raise RuntimeError(ffmpeg_error)
 
     def _finalize_process_startup(self):
         time.sleep(1.0)
         if self._process.poll() is not None:
             err = self._process.stderr.read().decode(errors="replace").strip()
-            raise RuntimeError(f"Audio subprocess failed: {err[:200]}")
+            raise RuntimeError(f"Audio subprocess failed: {err[:2000]}")
         threading.Thread(target=self._read_stderr, daemon=True).start()
         self.active = True
         log.info(f"Audio subprocess running (PID {self._process.pid})")
@@ -682,26 +1199,57 @@ class AudioEngine:
 
     def read_chunk(self) -> bytes:
         """Read one PCM16 chunk from subprocess pipe."""
-        if not self.active or not self._process:
+        process = self._process
+        if not self.active or not process:
             return b""
-        if self._process.poll() is not None:
-            log.error("Audio subprocess died")
-            self.active = False
-            return b""
+        process_ended = process.poll() is not None
         try:
             if self._protocol == "raw":
-                data = self._process.stdout.read(self.CHUNK_BYTES)
+                if self._prefetched_chunks:
+                    return self._prefetched_chunks.pop(0)
+                if process_ended:
+                    log.error("Audio subprocess died")
+                    self.active = False
+                    return b""
+                data = process.stdout.read(self.CHUNK_BYTES)
                 if not data or len(data) < self.CHUNK_BYTES:
                     self.active = False
                     return b""
                 return data
 
-            header = self._process.stdout.read(4)
+            if self._protocol == "file":
+                if self._prefetched_chunks:
+                    return self._prefetched_chunks.pop(0)
+                raw_file = self._raw_file
+                raw_path = self._raw_path
+                if raw_file is None or raw_path is None:
+                    self.active = False
+                    return b""
+                while self.active:
+                    try:
+                        available = os.path.getsize(raw_path) - raw_file.tell()
+                    except OSError:
+                        available = 0
+                    if available >= self.CHUNK_BYTES:
+                        data = raw_file.read(self.CHUNK_BYTES)
+                        if len(data) == self.CHUNK_BYTES:
+                            return data
+                    if process.poll() is not None:
+                        self.active = False
+                        return b""
+                    time.sleep(0.05)
+                return b""
+
+            if process_ended:
+                log.error("Audio subprocess died")
+                self.active = False
+                return b""
+            header = process.stdout.read(4)
             if not header or len(header) < 4:
                 self.active = False
                 return b""
             length = struct.unpack("<I", header)[0]
-            data = self._process.stdout.read(length)
+            data = process.stdout.read(length)
             if len(data) < length:
                 self.active = False
                 return b""
@@ -713,17 +1261,40 @@ class AudioEngine:
 
     def close(self):
         self.active = False
-        if self._process:
+        self._prefetched_chunks = []
+        raw_file = self._raw_file
+        self._raw_file = None
+        self._raw_path = None
+        if raw_file:
             try:
-                self._process.terminate()
-                self._process.wait(timeout=3)
+                raw_file.close()
+            except Exception:
+                pass
+        process = self._process
+        owns_process = self._owns_process
+        self._process = None
+        self._owns_process = True
+        if process and owns_process:
+            try:
+                if os.name == "nt" and getattr(process, "pid", None):
+                    sp.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        stdout=sp.DEVNULL,
+                        stderr=sp.DEVNULL,
+                        timeout=3,
+                    )
+                    process.wait(timeout=3)
+                else:
+                    process.terminate()
+                    process.wait(timeout=3)
             except Exception:
                 try:
-                    self._process.kill()
+                    process.kill()
                 except Exception:
                     pass
-            self._process = None
             log.info("Audio subprocess terminated")
+        elif process:
+            log.info("External audio file detached")
 
 
 # =============================================================================
@@ -938,12 +1509,32 @@ class WhisperFlowClient:
     def _on_stop_timeout(self):
         if not self._awaiting_stop_ack:
             return
+        log.warning("Finalization timeout: server did not confirm stop")
         self._finish_processing("Finalization timeout", self.YELLOW, "Server did not confirm stop; ready to record again")
 
     def _send_control(self, payload):
         if not _ws_is_open(self.websocket):
-            return
-        asyncio.run_coroutine_threadsafe(self.websocket.send(json.dumps(payload)), self.loop)
+            return False
+        future = asyncio.run_coroutine_threadsafe(self.websocket.send(json.dumps(payload)), self.loop)
+        try:
+            future.result(timeout=10)
+            log.info(f"Sent control frame: {payload.get('type')}")
+            return True
+        except Exception as exc:
+            log.warning(f"WebSocket control send failed: {exc}")
+            return False
+
+    def _send_audio_chunk(self, chunk):
+        if not _ws_is_open(self.websocket):
+            log.warning("WebSocket closed during capture")
+            return False
+        future = asyncio.run_coroutine_threadsafe(self.websocket.send(chunk), self.loop)
+        try:
+            future.result(timeout=10)
+            return True
+        except Exception as exc:
+            log.warning(f"WebSocket audio send failed: {exc}")
+            return False
 
     # --- Recording ---
 
@@ -979,6 +1570,9 @@ class WhisperFlowClient:
     def _capture_worker(self, mode):
         chunks_sent = 0
         bytes_sent = 0
+        cable_backend = mode == "system" and os.getenv("WHISPERFLOW_SYSTEM_BACKEND", "").strip().lower() == "cable"
+        debug_wav = _debug_wav_path("system_cable" if cable_backend else mode, force=cable_backend)
+        debug_chunks = [] if debug_wav else None
         t0 = time.time()
 
         try:
@@ -993,10 +1587,9 @@ class WhisperFlowClient:
                     break
                 bytes_sent += len(chunk)
                 chunks_sent += 1
-                if _ws_is_open(self.websocket):
-                    asyncio.run_coroutine_threadsafe(self.websocket.send(chunk), self.loop)
-                else:
-                    log.warning("WebSocket closed during capture")
+                if debug_chunks is not None:
+                    debug_chunks.append(chunk)
+                if not self._send_audio_chunk(chunk):
                     break
                 if chunks_sent % 10 == 0:
                     elapsed = time.time() - t0
@@ -1004,6 +1597,9 @@ class WhisperFlowClient:
 
         except Exception as e:
             log.error(f"Capture error: {e}")
+            self.is_recording = False
+            self._awaiting_stop_ack = False
+            self.root.after(0, self._cancel_stop_timeout)
             err_msg = str(e)[:100]
             self.root.after(0, lambda m=err_msg: self.rec_label.configure(text=f"Audio error: {m}", text_color=self.RED))
             self.root.after(0, lambda: self.record_btn.configure(text="RECORD", fg_color=self.RED, state="normal"))
@@ -1012,6 +1608,8 @@ class WhisperFlowClient:
             self.root.after(0, self._stop_animations)
         finally:
             self.engine.close()
+            if debug_chunks is not None:
+                _write_pcm16_wav(debug_wav, debug_chunks)
 
         elapsed = time.time() - t0
         log.info(f"Capture complete: {chunks_sent} chunks ({bytes_sent / 1024:.0f} KB) in {elapsed:.1f}s")
@@ -1021,8 +1619,9 @@ class WhisperFlowClient:
     def _stop_recording(self):
         self.is_recording = False
         self._awaiting_stop_ack = True
+        self.engine.close()
         self._cancel_stop_timeout()
-        self._stop_timeout_id = self.root.after(15000, self._on_stop_timeout)
+        self._stop_timeout_id = self.root.after(60000, self._on_stop_timeout)
         self._stop_animations()
         self.record_btn.configure(text="RECORD", fg_color=self.RED, hover_color="#c0392b", state="disabled")
         self.rec_label.configure(text="Processing...", text_color=self.YELLOW)
@@ -1101,6 +1700,7 @@ class WhisperFlowClient:
                 if data.get("type") == "session_started":
                     continue
                 if data.get("type") == "session_stopped":
+                    log.info("Received session_stopped")
                     self.root.after(0, self._handle_session_stopped)
                     continue
                 text = data.get("data", {}).get("text", "").strip()
